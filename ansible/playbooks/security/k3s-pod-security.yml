@@ -1,0 +1,250 @@
+---
+# Ansible Playbook: Implement Pod Security Standards
+#
+# This playbook configures Pod Security Admission for K3s cluster.
+#
+# Usage:
+#   ansible-playbook playbooks/security/k3s-pod-security.yml
+
+- name: Configure Pod Security Standards in K3s
+  hosts: pi-master
+  become: yes
+  gather_facts: no
+  vars:
+    k3s_config_dir: /etc/rancher/k3s
+    k3s_config_file: "{{ k3s_config_dir }}/config.yaml"
+
+  tasks:
+    - name: Create K3s config directory
+      file:
+        path: "{{ k3s_config_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Backup existing K3s config
+      copy:
+        src: "{{ k3s_config_file }}"
+        dest: "{{ k3s_config_file }}.backup.{{ ansible_date_time.epoch }}"
+        remote_src: yes
+      when: ansible_check_mode == false
+      failed_when: false
+
+    - name: Configure Pod Security Admission in K3s
+      blockinfile:
+        path: "{{ k3s_config_file }}"
+        create: yes
+        mode: '0644'
+        marker: "# {mark} ANSIBLE MANAGED - POD SECURITY"
+        block: |
+          # Pod Security Admission Configuration
+          kube-apiserver-arg:
+          - "admission-control-config-file=/etc/rancher/k3s/admission-config.yaml"
+          - "audit-log-path=/var/log/k3s-audit.log"
+          - "audit-log-maxage=30"
+          - "audit-log-maxbackup=10"
+          - "audit-log-maxsize=100"
+
+          # Disable Kubelet read-only port (security fix)
+          kubelet-arg:
+          - "read-only-port=0"
+          - "streaming-connection-idle-timeout=5m"
+          - "make-iptables-util-chains=true"
+
+    - name: Create Pod Security Admission configuration
+      copy:
+        dest: "{{ k3s_config_dir }}/admission-config.yaml"
+        mode: '0644'
+        content: |
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: AdmissionConfiguration
+          plugins:
+          - name: PodSecurity
+            configuration:
+              apiVersion: pod-security.admission.config.k8s.io/v1
+              kind: PodSecurityConfiguration
+              defaults:
+                enforce: "baseline"
+                enforce-version: "latest"
+                audit: "restricted"
+                audit-version: "latest"
+                warn: "restricted"
+                warn-version: "latest"
+              exemptions:
+                usernames: []
+                runtimeClasses: []
+                namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - longhorn-system
+                - cert-manager
+
+    - name: Label namespaces with Pod Security Standards
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              pod-security.kubernetes.io/enforce: "{{ item.enforce }}"
+              pod-security.kubernetes.io/audit: "{{ item.audit }}"
+              pod-security.kubernetes.io/warn: "{{ item.warn }}"
+      loop:
+        - { name: 'default', enforce: 'baseline', audit: 'restricted', warn: 'restricted' }
+        - { name: 'monitoring', enforce: 'baseline', audit: 'restricted', warn: 'restricted' }
+        - { name: 'logging', enforce: 'baseline', audit: 'restricted', warn: 'restricted' }
+        - { name: 'dev-tools', enforce: 'baseline', audit: 'restricted', warn: 'restricted' }
+        - { name: 'databases', enforce: 'baseline', audit: 'baseline', warn: 'baseline' }
+        - { name: 'kube-system', enforce: 'privileged', audit: 'privileged', warn: 'privileged' }
+        - { name: 'longhorn-system', enforce: 'privileged', audit: 'privileged', warn: 'privileged' }
+        - { name: 'cert-manager', enforce: 'baseline', audit: 'baseline', warn: 'baseline' }
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Restart K3s to apply configuration
+      systemd:
+        name: k3s
+        state: restarted
+      when: not ansible_check_mode
+
+    - name: Wait for K3s to be ready
+      wait_for:
+        host: 127.0.0.1
+        port: 6443
+        timeout: 120
+      when: not ansible_check_mode
+
+    - name: Verify Pod Security Admission is active
+      command: kubectl get --raw /metrics | grep pod_security
+      register: psa_metrics
+      changed_when: false
+      failed_when: false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display Pod Security Status
+      debug:
+        msg: "{{ psa_metrics.stdout_lines }}"
+      when: psa_metrics.rc == 0
+
+    - name: Create audit policy for security events
+      copy:
+        dest: "{{ k3s_config_dir }}/audit-policy.yaml"
+        mode: '0644'
+        content: |
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          rules:
+          # Log pod creation/deletion
+          - level: RequestResponse
+            verbs: ["create", "update", "patch", "delete"]
+            resources:
+            - group: ""
+              resources: ["pods", "pods/exec", "pods/portforward"]
+
+          # Log secret access
+          - level: Metadata
+            verbs: ["get", "list", "watch"]
+            resources:
+            - group: ""
+              resources: ["secrets"]
+
+          # Log RBAC changes
+          - level: RequestResponse
+            verbs: ["create", "update", "patch", "delete"]
+            resources:
+            - group: "rbac.authorization.k8s.io"
+              resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+
+          # Log privileged operations
+          - level: RequestResponse
+            verbs: ["create", "update", "patch"]
+            resources:
+            - group: ""
+              resources: ["pods"]
+            omitStages:
+            - "RequestReceived"
+
+          # Don't log read-only requests
+          - level: None
+            verbs: ["get", "list", "watch"]
+
+- name: Verify Pod Security Configuration
+  hosts: pi-master
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Check namespace labels
+      command: kubectl get namespaces -o json
+      register: namespaces_json
+      changed_when: false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display namespace security levels
+      debug:
+        msg: |
+          Namespace Security Configuration:
+          {{ namespaces_json.stdout | from_json | json_query('items[*].[metadata.name, metadata.labels]') }}
+
+    - name: Test Pod Security - Try to create privileged pod
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: security-test-privileged
+            namespace: default
+          spec:
+            containers:
+            - name: test
+              image: busybox
+              command: ["sleep", "3600"]
+              securityContext:
+                privileged: true
+      register: priv_test
+      failed_when: false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display privileged pod test result
+      debug:
+        msg: |
+          Privileged pod in 'default' namespace should be REJECTED:
+          Result: {{ 'PASSED - Pod was rejected' if priv_test.failed else 'FAILED - Pod was allowed!' }}
+
+    - name: Clean up test pod if created
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        name: security-test-privileged
+        namespace: default
+      when: not priv_test.failed
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Generate security report
+      shell: |
+        echo "=== Pod Security Standards Report ==="
+        echo ""
+        echo "Enabled Namespaces:"
+        kubectl get namespaces -o json | jq -r '.items[] | select(.metadata.labels["pod-security.kubernetes.io/enforce"]) | .metadata.name + ": " + .metadata.labels["pod-security.kubernetes.io/enforce"]'
+        echo ""
+        echo "Audit Log:"
+        if [ -f /var/log/k3s-audit.log ]; then
+          tail -20 /var/log/k3s-audit.log | grep -i "pod" || echo "No recent pod events"
+        else
+          echo "Audit log not yet created"
+        fi
+      register: security_report
+      changed_when: false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display security report
+      debug:
+        var: security_report.stdout_lines

@@ -1,0 +1,49 @@
+---
+# Network configuration
+synology_ip: 192.168.1.10
+nfs_shares:
+  data: /volume1/pi-cluster-data
+  backup: /volume1/pi-cluster-backup
+# System packages
+base_packages:
+  - vim
+  - htop
+  - chrony
+  - tmux
+  - git
+  - nfs-common
+  - cgroup-tools
+# Security settings
+security:
+  timezone: UTC
+
+# K3S Configuration Variables
+k3s_version: "v1.32.2+k3s1"
+k3s_server_args: "--disable traefik --node-label node.kubernetes.io/role=master --node-taint node-role.kubernetes.io/master=true:NoSchedule --flannel-backend=host-gw --docker"
+k3s_agent_args: "--node-label node.kubernetes.io/role=worker --docker"
+
+# Registry Configuration
+registry_domain: "cluster-registry:5000"
+registry_user: "admin"
+registry_password: "Admin123"
+
+# NFS Configuration
+#synology_ip: "192.168.1.10"
+#nfs_shares:
+#  data: /volume1/pi-cluster-data
+#  backup: /volume1/pi-cluster-backup
+k3s_images_mount_point: "/var/lib/rancher/k3s/agent/containerd"
+
+# Network Configuration
+calico_version: "v3.28.0"
+
+# Dashboard Configuration
+dashboard_version: "v2.7.0"
+dashboard_nodeport: 30001
+
+# Storage Configuration
+longhorn_version: "v1.6.0"
+longhorn_ui_nodeport: 30100
+
+# Metrics Configuration
+metrics_version: "v0.6.3"

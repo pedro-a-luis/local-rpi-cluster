@@ -1,0 +1,216 @@
+---
+# Setup Gravity Sync for Pi-hole Replication
+# This playbook sets up automatic synchronization between Pi-hole servers
+# Primary: rpi-vpn-1 (192.168.1.25), Secondary: rpi-vpn-2 (192.168.1.26)
+
+- name: Setup SSH Keys for Gravity Sync
+  hosts: pihole
+  become: yes
+  vars:
+    primary_host: "192.168.1.25"
+    secondary_host: "192.168.1.26"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - rsync
+          - ssh
+          - sudo
+          - cron
+        state: present
+        update_cache: yes
+
+    - name: Generate SSH key for admin user
+      become_user: admin
+      shell: |
+        if [ ! -f ~/.ssh/id_rsa ]; then
+          ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N "" -C "gravity-sync"
+        fi
+      args:
+        creates: /home/admin/.ssh/id_rsa
+
+    - name: Get public key from primary
+      shell: cat /home/admin/.ssh/id_rsa.pub
+      register: primary_pubkey
+      when: inventory_hostname == 'rpi-vpn-1'
+
+    - name: Get public key from secondary
+      shell: cat /home/admin/.ssh/id_rsa.pub
+      register: secondary_pubkey
+      when: inventory_hostname == 'rpi-vpn-2'
+
+- name: Exchange SSH Keys
+  hosts: pihole
+  become: yes
+  vars:
+    primary_key: "{{ hostvars['rpi-vpn-1'].primary_pubkey.stdout | default('') }}"
+    secondary_key: "{{ hostvars['rpi-vpn-2'].secondary_pubkey.stdout | default('') }}"
+
+  tasks:
+    - name: Add secondary key to primary authorized_keys
+      authorized_key:
+        user: admin
+        key: "{{ secondary_key }}"
+        state: present
+      when:
+        - inventory_hostname == 'rpi-vpn-1'
+        - secondary_key != ''
+
+    - name: Add primary key to secondary authorized_keys
+      authorized_key:
+        user: admin
+        key: "{{ primary_key }}"
+        state: present
+      when:
+        - inventory_hostname == 'rpi-vpn-2'
+        - primary_key != ''
+
+    - name: Test SSH connection from secondary to primary
+      become_user: admin
+      shell: ssh -o StrictHostKeyChecking=no admin@{{ hostvars['rpi-vpn-1'].ansible_host }} 'echo "SSH OK"'
+      register: ssh_test
+      when: inventory_hostname == 'rpi-vpn-2'
+      changed_when: false
+
+    - name: Display SSH test result
+      debug:
+        msg: "{{ ssh_test.stdout }}"
+      when:
+        - inventory_hostname == 'rpi-vpn-2'
+        - ssh_test is defined
+
+- name: Install Gravity Sync on Secondary
+  hosts: rpi-vpn-2
+  become: yes
+  vars:
+    primary_host: "192.168.1.25"
+    gravity_sync_version: "4.0.2"
+
+  tasks:
+    - name: Check if Gravity Sync is already installed
+      stat:
+        path: /usr/local/bin/gravity-sync
+      register: gravity_sync_installed
+
+    - name: Download Gravity Sync installer
+      get_url:
+        url: https://raw.githubusercontent.com/vmstan/gravity-sync/{{ gravity_sync_version }}/gs-install.sh
+        dest: /tmp/gs-install.sh
+        mode: '0755'
+      when: not gravity_sync_installed.stat.exists
+
+    - name: Run Gravity Sync installer
+      shell: |
+        export GRAVITY_SYNC_AUTO_CONFIGURE=true
+        bash /tmp/gs-install.sh
+      args:
+        creates: /usr/local/bin/gravity-sync
+      environment:
+        GRAVITY_SYNC_AUTO_CONFIGURE: "true"
+
+    - name: Create Gravity Sync configuration
+      copy:
+        content: |
+          # Gravity Sync Configuration
+          REMOTE_HOST='{{ hostvars['rpi-vpn-1'].ansible_host }}'
+          REMOTE_USER='admin'
+
+          # Pi-hole Paths
+          PIHOLE_DIR='/etc/pihole'
+          PIHOLE_BIN='/usr/local/bin/pihole'
+
+          # Sync Settings
+          GRAVITY_FI='gravity.db'
+          CUSTOM_DNS='custom.list'
+
+          # Automation
+          CRONJOB_SYNC='*/15 * * * *'
+
+          # Logging
+          LOG_PATH='/var/log'
+          SYNCING_LOG='1'
+
+          # Backup
+          BACKUP_RETAIN='7'
+        dest: /etc/gravity-sync/gravity-sync.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Ensure Gravity Sync directory permissions
+      file:
+        path: /etc/gravity-sync
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Run initial Gravity Sync pull
+      shell: gravity-sync pull
+      register: initial_sync
+      become_user: admin
+      changed_when: "'DONE' in initial_sync.stdout"
+      failed_when: false
+
+    - name: Display initial sync result
+      debug:
+        msg: "{{ initial_sync.stdout_lines }}"
+      when: initial_sync is defined
+
+    - name: Enable Gravity Sync automation (cron)
+      shell: gravity-sync auto
+      register: auto_enable
+      changed_when: "'enabled' in auto_enable.stdout"
+
+    - name: Display automation status
+      debug:
+        msg: "{{ auto_enable.stdout_lines }}"
+
+    - name: Verify Gravity Sync status
+      shell: gravity-sync version
+      register: gs_version
+      changed_when: false
+
+    - name: Display Gravity Sync version
+      debug:
+        msg: "{{ gs_version.stdout_lines }}"
+
+- name: Final Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display setup summary
+      debug:
+        msg: |
+          =================================================
+          GRAVITY SYNC SETUP COMPLETE
+          =================================================
+
+          Primary Pi-hole: rpi-vpn-1 (192.168.1.25)
+          Secondary Pi-hole: rpi-vpn-2 (192.168.1.26)
+
+          Synchronization:
+          - Automatic sync every 15 minutes
+          - Syncs gravity.db (blocklists)
+          - Syncs custom DNS entries
+          - Syncs whitelist/blacklist
+
+          Management Commands (run on rpi-vpn-2):
+          - gravity-sync pull    # Manual sync from primary
+          - gravity-sync push    # Push to primary (not recommended)
+          - gravity-sync compare # Compare differences
+          - gravity-sync status  # Check sync status
+          - gravity-sync logs    # View sync logs
+
+          IMPORTANT:
+          - Make all Pi-hole changes on PRIMARY (rpi-vpn-1)
+          - Secondary will sync automatically every 15 minutes
+          - Both servers must be running for sync to work
+
+          Web Interfaces:
+          - Primary: http://192.168.1.25/admin
+          - Secondary: http://192.168.1.26/admin
+
+          =================================================

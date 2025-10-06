@@ -1,0 +1,14 @@
+---
+- name: Deploy backup script
+  template:
+    src: backup.sh.j2
+    dest: /usr/local/bin/cluster-backup
+    mode: 0755
+
+- name: Schedule daily backups
+  cron:
+    name: "Cluster backup job"
+    minute: "0"
+    hour: "2"
+    job: "/usr/local/bin/cluster-backup"
+

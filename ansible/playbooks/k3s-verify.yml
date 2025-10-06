@@ -1,0 +1,200 @@
+---
+# 3.6. K3s Verification and Maintenance Playbook - ~/ansible/playbooks/k3s-verify.yml
+# This playbook performs verification and health checks on the K3s cluster
+
+- name: Verify K3s cluster health
+  hosts: master
+  become: no
+  tasks:
+    - name: Get node status
+      shell: k3s kubectl get nodes
+      register: nodes
+      changed_when: false
+      
+    - name: Check for NotReady nodes
+      shell: k3s kubectl get nodes | grep -v Ready | grep -v STATUS
+      register: not_ready
+      failed_when: not_ready.rc == 0
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Count Ready nodes
+      shell: k3s kubectl get nodes | grep Ready | wc -l
+      register: ready_count
+      changed_when: false
+      
+    - name: Verify all nodes are Ready
+      assert:
+        that: 
+          - ready_count.stdout | int == groups['cluster'] | length
+        fail_msg: "Not all nodes are in Ready state"
+        success_msg: "All {{ ready_count.stdout }} nodes are Ready"
+        
+    - name: Get all pods status 
+      shell: k3s kubectl get pods --all-namespaces
+      register: all_pods
+      changed_when: false
+      
+    - name: Count unhealthy pods
+      shell: k3s kubectl get pods --all-namespaces | grep -v Running | grep -v Completed | grep -v NAME | wc -l
+      register: unhealthy_pods
+      changed_when: false
+      
+    - name: Display unhealthy pods if any
+      shell: k3s kubectl get pods --all-namespaces | grep -v Running | grep -v Completed | grep -v NAME
+      register: unhealthy_pods_details
+      when: unhealthy_pods.stdout | int > 0
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Show unhealthy pods details
+      debug:
+        msg: "{{ unhealthy_pods_details.stdout_lines }}"
+      when: unhealthy_pods.stdout | int > 0
+        
+    - name: Check component health - kube-system
+      shell: k3s kubectl get pods -n kube-system
+      register: kube_system
+      changed_when: false
+      
+    - name: Display kube-system status
+      debug:
+        msg: "{{ kube_system.stdout_lines }}"
+        
+    - name: Check component health - Longhorn
+      shell: k3s kubectl get pods -n longhorn-system
+      register: longhorn
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Longhorn status
+      debug:
+        msg: "{{ longhorn.stdout_lines }}"
+      when: longhorn.rc == 0
+        
+    - name: Check component health - Nginx Ingress
+      shell: k3s kubectl get pods -n ingress-nginx
+      register: nginx
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Nginx Ingress status
+      debug:
+        msg: "{{ nginx.stdout_lines }}"
+      when: nginx.rc == 0
+        
+    - name: Check component health - Monitoring
+      shell: k3s kubectl get pods -n monitoring
+      register: monitoring
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Monitoring status
+      debug:
+        msg: "{{ monitoring.stdout_lines }}"
+      when: monitoring.rc == 0
+        
+    - name: Check Persistent Volumes
+      shell: k3s kubectl get pv
+      register: pvs
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display PV status
+      debug:
+        msg: "{{ pvs.stdout_lines }}"
+      when: pvs.rc == 0
+        
+    - name: Check Persistent Volume Claims
+      shell: k3s kubectl get pvc --all-namespaces
+      register: pvcs
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display PVC status
+      debug:
+        msg: "{{ pvcs.stdout_lines }}"
+      when: pvcs.rc == 0
+        
+    - name: Check StorageClasses
+      shell: k3s kubectl get storageclass
+      register: sc
+      changed_when: false
+      
+    - name: Display StorageClass status
+      debug:
+        msg: "{{ sc.stdout_lines }}"
+        
+    - name: Check Ingress resources
+      shell: k3s kubectl get ingress --all-namespaces
+      register: ingress
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Ingress status
+      debug:
+        msg: "{{ ingress.stdout_lines }}"
+      when: ingress.rc == 0
+        
+    - name: Check cluster events
+      shell: k3s kubectl get events --sort-by='.lastTimestamp' | tail -10
+      register: events
+      changed_when: false
+      
+    - name: Display recent events
+      debug:
+        msg: "{{ events.stdout_lines }}"
+        
+    - name: Display overall cluster health
+      debug:
+        msg: |
+          -------------------------------------------------------
+          K3s CLUSTER HEALTH SUMMARY
+          -------------------------------------------------------
+          Nodes:      {{ ready_count.stdout }} / {{ groups['cluster'] | length }} Ready
+          Unhealthy Pods: {{ unhealthy_pods.stdout }}
+          
+          Overall Status: {{ 'HEALTHY' if (ready_count.stdout | int == groups['cluster'] | length) and (unhealthy_pods.stdout | int == 0) else 'ISSUES DETECTED' }}
+          -------------------------------------------------------
+          
+- name: Check system resources on all nodes
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Check disk space
+      shell: df -h / /var/lib/rancher
+      register: disk_space
+      changed_when: false
+      
+    - name: Display disk space
+      debug:
+        msg: "{{ disk_space.stdout_lines }}"
+        
+    - name: Check memory usage
+      shell: free -h
+      register: memory
+      changed_when: false
+      
+    - name: Display memory usage
+      debug:
+        msg: "{{ memory.stdout_lines }}"
+        
+    - name: Check CPU load
+      shell: top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}'
+      register: cpu_load
+      changed_when: false
+      
+    - name: Display CPU load
+      debug:
+        msg: "CPU Usage: {{ cpu_load.stdout }}%"
+        
+    - name: Check running containers
+      shell: docker ps --format "table {{'{{'}}.Names{{'}}'}}\t{{'{{'}}.Status{{'}}'}}\t{{'{{'}}.Image{{'}}'}} " | head -20
+      register: containers
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display running containers
+      debug:
+        msg: "{{ containers.stdout_lines | default(['No container output available']) }}"
+      when: containers is succeeded

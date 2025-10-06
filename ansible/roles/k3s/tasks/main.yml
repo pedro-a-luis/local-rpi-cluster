@@ -1,0 +1,29 @@
+---
+- name: Install K3s server (master)
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_EXEC="--tls-san {{ hostvars[groups['master'][0]].ansible_host }} --disable traefik" sh -
+  when: inventory_hostname in groups['master']
+  register: k3s_install
+  changed_when: "'already installed' not in k3s_install.stdout"
+
+- name: Get node token from master
+  shell: cat /var/lib/rancher/k3s/server/node-token
+  when: inventory_hostname in groups['master']
+  run_once: yes
+  delegate_to: "{{ groups['master'][0] }}"
+  register: master_token
+
+- name: Set global cluster token fact
+  set_fact:
+    k3s_node_token: "{{ hostvars[groups['master'][0]].master_token.stdout }}"
+  run_once: yes
+
+- name: Install K3s agent (workers)
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    K3S_URL=https://{{ hostvars[groups['master'][0]].ansible_host }}:6443 \
+    K3S_TOKEN={{ k3s_node_token }} sh -
+  when: inventory_hostname in groups['workers']
+  register: k3s_install
+  changed_when: "'already installed' not in k3s_install.stdout"

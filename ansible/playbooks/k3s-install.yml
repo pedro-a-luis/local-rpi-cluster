@@ -1,0 +1,194 @@
+---
+# 3.1. K3s Installation Playbook - ~/ansible/playbooks/k3s-install.yml
+# This playbook installs K3s on the Raspberry Pi cluster
+# The master node runs a server instance, while worker nodes run agent instances
+
+- name: Install k3s on master node
+  hosts: master
+  become: yes
+  vars:
+    k3s_version: "v1.28.6+k3s2"  # Using a recent stable version
+    registry_domain: "cluster-registry:5000"
+  tasks:
+    - name: Check if k3s is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Ensure curl is installed
+      apt:
+        name: curl
+        state: present
+      when: not k3s_binary.stat.exists
+
+    - name: Create k3s configuration directory
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Configure k3s to use private registry
+      copy:
+        content: |
+          mirrors:
+            "{{ registry_domain }}":
+              endpoint:
+                - "http://{{ registry_domain }}"
+          configs:
+            "{{ registry_domain }}":
+              auth:
+                username: admin
+                password: Admin123
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: '0600'
+
+    - name: Download and install k3s on master node
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        sh -s - --write-kubeconfig-mode 644 \
+        --disable traefik \
+        --node-label "node.kubernetes.io/role=master" \
+        --node-taint "node-role.kubernetes.io/control-plane=true:NoSchedule" \
+        --flannel-backend=host-gw \
+        --docker
+      args:
+        creates: /usr/local/bin/k3s
+      when: not k3s_binary.stat.exists
+      environment:
+        INSTALL_K3S_EXEC: "server"
+        
+    - name: Fix permissions on k3s.yaml (if needed)
+      file:
+        path: /etc/rancher/k3s/k3s.yaml
+        mode: '0644'
+      changed_when: false
+        
+    - name: Wait for k3s to start on master node
+      pause:
+        seconds: 30
+      when: not k3s_binary.stat.exists
+        
+    - name: Get k3s token
+      command: cat /var/lib/rancher/k3s/server/node-token
+      register: node_token
+      changed_when: false
+      
+    - name: Create .kube directory
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+
+    - name: Copy kubeconfig to user directory
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      
+    - name: Update kubeconfig with external IP
+      replace:
+        path: "/home/{{ ansible_user }}/.kube/config"
+        regexp: 'https://127.0.0.1:6443'
+        replace: 'https://{{ ansible_host }}:6443'
+
+    - name: Share node token with group
+      set_fact:
+        k3s_node_token: "{{ node_token.stdout }}"
+        k3s_master_ip: "{{ ansible_host }}"
+      delegate_facts: true
+
+- name: Create directories on worker nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Create k3s configuration directory on workers
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Configure k3s to use private registry on workers
+      copy:
+        content: |
+          mirrors:
+            "cluster-registry:5000":
+              endpoint:
+                - "http://cluster-registry:5000"
+          configs:
+            "cluster-registry:5000":
+              auth:
+                username: admin
+                password: Admin123
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: '0600'
+
+- name: Install k3s on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    k3s_version: "v1.28.6+k3s2"  # Use the same version as master
+  tasks:
+    - name: Check if k3s is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Ensure curl is installed
+      apt:
+        name: curl
+        state: present
+      when: not k3s_binary.stat.exists
+        
+    - name: Download and install k3s on worker nodes
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        K3S_URL=https://{{ hostvars[groups['master'][0]]['ansible_host'] }}:6443 \
+        K3S_TOKEN={{ hostvars[groups['master'][0]]['k3s_node_token'] }} \
+        sh -s - --node-label "node.kubernetes.io/role=worker" \
+        --docker
+      args:
+        creates: /usr/local/bin/k3s
+      when: not k3s_binary.stat.exists and hostvars[groups['master'][0]]['k3s_node_token'] is defined
+      environment:
+        INSTALL_K3S_EXEC: "agent"
+
+- name: Verify k3s cluster
+  hosts: master
+  become: no
+  tasks:
+    - name: Wait for nodes to become ready
+      shell: k3s kubectl get nodes | grep Ready | wc -l
+      register: ready_nodes
+      until: ready_nodes.stdout | int == groups['cluster'] | length
+      retries: 10
+      delay: 30
+      changed_when: false
+      
+    - name: Display node status
+      shell: k3s kubectl get nodes -o wide
+      register: nodes_status
+      changed_when: false
+      
+    - name: Show node status
+      debug:
+        msg: "{{ nodes_status.stdout_lines }}"
+        
+    - name: Get pod status
+      shell: k3s kubectl get pods --all-namespaces
+      register: pods_status
+      changed_when: false
+      
+    - name: Show pod status
+      debug:
+        msg: "{{ pods_status.stdout_lines }}"

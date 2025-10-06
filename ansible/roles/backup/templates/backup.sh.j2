@@ -1,0 +1,19 @@
+#!/bin/bash
+# Cluster backup script
+DATE=$(date +%Y%m%d-%H%M%S)
+HOST=$(hostname -s)
+BACKUP_ROOT="/mnt/cluster-backup"
+
+mkdir -p $BACKUP_ROOT/$HOST
+
+# System configuration backup
+tar -czf $BACKUP_ROOT/$HOST/system-$DATE.tar.gz \
+  /etc/ssh \
+  /etc/network \
+  /etc/hosts \
+  /home/admin/.ssh \
+  /etc/cron.* \
+  /var/spool/cron
+
+# Cleanup old backups (keep 30 days)
+find $BACKUP_ROOT/$HOST -name "*.tar.gz" -mtime +30 -delete

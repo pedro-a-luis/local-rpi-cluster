@@ -1,0 +1,35 @@
+# Python dependencies for Raspberry Pi Cluster Project
+# Core Ansible requirements
+ansible>=2.14.0
+ansible-core>=2.14.0
+
+# Kubernetes integration
+kubernetes>=23.6.0
+openshift>=0.13.1
+
+# Other Ansible collection dependencies
+jmespath>=1.0.1
+netaddr>=0.8.0
+PyYAML>=6.0
+jsonpatch>=1.32
+cryptography>=38.0.0
+
+# Docker related
+docker>=6.0.0
+docker-compose>=1.29.2
+
+# Testing and validation
+pytest>=7.0.0
+pytest-testinfra>=6.6.0
+
+# Linting and security scanning
+yamllint>=1.26.3
+ansible-lint>=6.0.0
+
+# Documentation
+markdown>=3.3.6
+mdx-truly-sane-lists>=1.3
+
+# Monitoring and metrics
+prometheus-client>=0.14.1
+grafana-api-client>=1.0.0

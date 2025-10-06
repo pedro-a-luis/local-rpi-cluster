@@ -1,0 +1,507 @@
+---
+# Complete K3s Installation Playbook - ~/ansible/playbooks/complete-k3s-install.yml
+# This playbook performs a complete K3s installation with all necessary features
+# Reference: Sections 2.x and 3.x of documentation
+
+- name: Complete K3s cluster installation
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Installation overview
+      debug:
+        msg: |
+          ============================================
+          K3S CLUSTER INSTALLATION
+          ============================================
+          This playbook will:
+          1. Configure base system settings
+          2. Set up NFS mounts for storage and backups
+          3. Install K3s on all nodes
+          4. Configure backup automation
+          5. Prepare for application deployment
+          
+          Ensure your Synology NAS shares are configured:
+          - pi-cluster-backup (for backups)
+          - pi-cluster-data (for shared storage)
+          
+          Press Enter to continue or Ctrl+C to abort
+
+    - name: Confirm installation
+      pause:
+        prompt: "Press Enter to start installation"
+
+# Phase 1: Base Configuration
+- name: Apply base configuration to all nodes
+  hosts: cluster
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+      
+    - name: Update /etc/hosts with cluster nodes
+      lineinfile:
+        path: /etc/hosts
+        regexp: ".*{{ item }}$"
+        line: "{{ hostvars[item]['ansible_host'] }} {{ item }}"
+        state: present
+      loop: "{{ groups['cluster'] }}"
+      
+    - name: Update and upgrade apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+        cache_valid_time: 86400
+        
+    - name: Install essential packages
+      apt:
+        name:
+          - vim
+          - htop
+          - iotop
+          - iftop
+          - tmux
+          - git
+          - curl
+          - wget
+          - nmon
+          - ntp
+          - nfs-common
+          - python3-pip
+        state: present
+        
+    - name: Set timezone
+      timezone:
+        name: UTC
+        
+    - name: Enable cgroup support for Kubernetes
+      lineinfile:
+        path: /boot/firmware/cmdline.txt
+        backrefs: yes
+        regexp: '^((?!.*\bcgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory\b).*)$'
+        line: '\1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory'
+      register: cgroup_result
+      
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+      
+    - name: Load necessary kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - br_netfilter
+        - overlay
+        
+    - name: Make kernel modules persistent
+      lineinfile:
+        path: /etc/modules-load.d/k3s.conf
+        line: "{{ item }}"
+        create: yes
+      with_items:
+        - br_netfilter
+        - overlay
+        
+    - name: Set sysctl parameters
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+      with_items:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+        
+    - name: Reboot if cgroup config was changed
+      reboot:
+        reboot_timeout: 300
+      when: cgroup_result.changed
+
+# Phase 2: NFS Configuration
+- name: Configure NFS storage and backup mounts
+  hosts: cluster
+  become: yes
+  vars:
+    synology_ip: "192.168.1.10"
+    backup_share: "/volume1/pi-cluster-backup"
+    data_share: "/volume1/pi-cluster-data"
+  tasks:
+    - name: Install NFS utilities
+      apt:
+        name: nfs-common
+        state: present
+        
+    - name: Create mount directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - /mnt/backup
+        - /mnt/shared-data
+        
+    - name: Test NFS connectivity
+      shell: |
+        showmount -e {{ synology_ip }}
+      register: nfs_test
+      ignore_errors: yes
+      changed_when: false
+      
+    - name: Add backup NFS mount to fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ synology_ip }}:{{ backup_share }} /mnt/backup nfs defaults,_netdev,soft,intr,rsize=8192,wsize=8192 0 0"
+        state: present
+        
+    - name: Add shared data NFS mount to fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ synology_ip }}:{{ data_share }} /mnt/shared-data nfs defaults,_netdev,soft,intr,rsize=8192,wsize=8192 0 0"
+        state: present
+        
+    - name: Mount NFS shares
+      shell: mount -a
+      register: mount_result
+      ignore_errors: yes
+      
+    - name: Verify mounts
+      shell: |
+        mount | grep {{ item }}
+      with_items:
+        - /mnt/backup
+        - /mnt/shared-data
+      register: mount_check
+      ignore_errors: yes
+      changed_when: false
+
+# Phase 3: K3s Installation
+- name: Install K3s on master node
+  hosts: master
+  become: yes
+  vars:
+    k3s_version: "v1.32.2+k3s1"
+  tasks:
+    - name: Create K3s configuration directory
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+        
+    - name: Configure K3s registries
+      copy:
+        content: |
+          mirrors:
+            "docker.io":
+              endpoint:
+                - "https://registry-1.docker.io"
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: '0600'
+        
+    - name: Download and install K3s on master
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        sh -s - server \
+        --write-kubeconfig-mode 644 \
+        --disable traefik \
+        --node-label "node.kubernetes.io/role=master" \
+        --flannel-backend=host-gw \
+        --disable-cloud-controller \
+        --disable local-storage
+      args:
+        creates: /usr/local/bin/k3s
+        
+    - name: Wait for K3s to start
+      wait_for:
+        port: 6443
+        host: "{{ ansible_host }}"
+        delay: 10
+        timeout: 300
+        
+    - name: Wait for node to be ready
+      shell: |
+        until k3s kubectl get nodes | grep -E "Ready.*master"; do
+          sleep 5
+        done
+      timeout: 300
+      
+    - name: Get K3s token
+      command: cat /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+      changed_when: false
+      
+    - name: Store K3s token
+      set_fact:
+        k3s_node_token: "{{ k3s_token.stdout }}"
+        
+    - name: Create .kube directory for admin user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+        
+    - name: Copy kubeconfig to admin user
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+        
+    - name: Update kubeconfig with external IP
+      replace:
+        path: "/home/{{ ansible_user }}/.kube/config"
+        regexp: 'https://127.0.0.1:6443'
+        replace: 'https://{{ ansible_host }}:6443'
+
+- name: Install K3s on worker nodes
+  hosts: workers
+  become: yes
+  vars:
+    k3s_version: "v1.32.2+k3s1"
+  tasks:
+    - name: Create K3s configuration directory
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+        
+    - name: Configure K3s registries
+      copy:
+        content: |
+          mirrors:
+            "docker.io":
+              endpoint:
+                - "https://registry-1.docker.io"
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: '0600'
+        
+    - name: Install K3s on workers
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        K3S_URL=https://{{ hostvars[groups['master'][0]]['ansible_host'] }}:6443 \
+        K3S_TOKEN={{ hostvars[groups['master'][0]]['k3s_node_token'] }} \
+        sh -s - agent \
+        --node-label "node.kubernetes.io/role=worker"
+      args:
+        creates: /usr/local/bin/k3s
+
+# Phase 4: Verify Installation
+- name: Verify K3s cluster
+  hosts: master
+  become: yes
+  tasks:
+    - name: Wait for all nodes to be ready
+      shell: |
+        expected_nodes={{ groups['cluster'] | length }}
+        for i in $(seq 1 30); do
+          ready_nodes=$(kubectl get nodes --no-headers | grep -c Ready)
+          if [ $ready_nodes -eq $expected_nodes ]; then
+            echo "All nodes ready"
+            exit 0
+          fi
+          echo "Waiting for nodes: $ready_nodes/$expected_nodes ready"
+          sleep 10
+        done
+        exit 1
+      register: nodes_ready
+      
+    - name: Display node status
+      shell: kubectl get nodes -o wide
+      register: node_status
+      changed_when: false
+      
+    - name: Show cluster status
+      debug:
+        msg: "{{ node_status.stdout_lines }}"
+        
+    - name: Label nodes for storage
+      shell: |
+        kubectl label nodes {{ item }} pi=enabled --overwrite
+      with_items: "{{ groups['cluster'] }}"
+
+# Phase 5: Install Helm
+- name: Install Helm on master node
+  hosts: master
+  become: yes
+  tasks:
+    - name: Download Helm installation script
+      get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get_helm.sh
+        mode: '0700'
+        
+    - name: Install Helm
+      command: /tmp/get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+        
+    - name: Add common Helm repositories
+      shell: |
+        helm repo add stable https://charts.helm.sh/stable
+        helm repo add bitnami https://charts.bitnami.com/bitnami
+        helm repo add longhorn https://charts.longhorn.io
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+# Phase 6: Configure Backup Automation
+- name: Configure backup automation
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Check if backup mount is available
+      stat:
+        path: /mnt/backup
+      register: backup_mount
+      
+    - name: Create system backup script
+      copy:
+        content: |
+          #!/bin/bash
+          DATE=$(date +%Y%m%d-%H%M%S)
+          HOSTNAME=$(hostname)
+          BACKUP_DIR="/mnt/backup/$HOSTNAME"
+          
+          # Create backup directory
+          mkdir -p $BACKUP_DIR
+          
+          # System configuration backup
+          tar -czf $BACKUP_DIR/system-config-$DATE.tar.gz \
+            /etc/rancher \
+            /etc/hosts \
+            /etc/hostname \
+            /etc/fstab \
+            /home/{{ ansible_user }}/.kube \
+            2>/dev/null
+            
+          # Keep only last 14 days
+          find $BACKUP_DIR -name "system-config-*.tar.gz" -mtime +14 -delete
+          
+          echo "Backup completed: $BACKUP_DIR/system-config-$DATE.tar.gz"
+        dest: /usr/local/bin/backup-system.sh
+        mode: '0755'
+      when: backup_mount.stat.exists
+      
+    - name: Create K3s backup script (master only)
+      copy:
+        content: |
+          #!/bin/bash
+          DATE=$(date +%Y%m%d-%H%M%S)
+          BACKUP_DIR="/mnt/backup/k3s"
+          
+          # Create backup directory
+          mkdir -p $BACKUP_DIR
+          
+          # Backup K3s data
+          systemctl stop k3s
+          tar -czf $BACKUP_DIR/k3s-server-$DATE.tar.gz \
+            /var/lib/rancher/k3s/server \
+            /etc/rancher/k3s
+          systemctl start k3s
+          
+          # Export cluster resources
+          mkdir -p $BACKUP_DIR/resources
+          kubectl get all --all-namespaces -o yaml > $BACKUP_DIR/resources/all-resources-$DATE.yaml
+          
+          # Keep only last 7 days
+          find $BACKUP_DIR -name "k3s-server-*.tar.gz" -mtime +7 -delete
+          find $BACKUP_DIR/resources -name "all-resources-*.yaml" -mtime +7 -delete
+          
+          echo "K3s backup completed"
+        dest: /usr/local/bin/backup-k3s.sh
+        mode: '0755'
+      when:
+        - backup_mount.stat.exists
+        - inventory_hostname in groups['master']
+        
+    - name: Set up backup cron jobs
+      cron:
+        name: "{{ item.name }}"
+        hour: "{{ item.hour }}"
+        minute: "{{ item.minute }}"
+        job: "{{ item.job }}"
+        user: root
+      with_items:
+        - { name: "System backup", hour: "2", minute: "0", job: "/usr/local/bin/backup-system.sh" }
+        - { name: "K3s backup", hour: "3", minute: "0", job: "/usr/local/bin/backup-k3s.sh" }
+      when: 
+        - backup_mount.stat.exists
+        - inventory_hostname in groups['master'] or item.name == "System backup"
+
+# Phase 7: Final Configuration
+- name: Final cluster configuration
+  hosts: master
+  become: yes
+  tasks:
+    - name: Create NFS storage class manifest
+      copy:
+        content: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: nfs-provisioner
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: nfs-storage
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "false"
+          provisioner: kubernetes.io/no-provisioner
+          volumeBindingMode: WaitForFirstConsumer
+        dest: /tmp/nfs-storage-class.yaml
+        
+    - name: Apply NFS storage class
+      shell: kubectl apply -f /tmp/nfs-storage-class.yaml
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+        
+    - name: Create application namespace
+      shell: |
+        kubectl create namespace apps --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+- name: Installation complete
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display completion message
+      debug:
+        msg: |
+          ============================================
+          K3S INSTALLATION COMPLETE
+          ============================================
+          
+          Cluster Details:
+          - Master: {{ hostvars[groups['master'][0]]['ansible_host'] }}
+          - Workers: {{ groups['workers'] | length }}
+          - Total Nodes: {{ groups['cluster'] | length }}
+          
+          Features Configured:
+          ✓ K3s {{ hostvars[groups['master'][0]]['k3s_version'] | default('latest') }}
+          ✓ NFS storage mounts
+          ✓ Automated backups (if NFS available)
+          ✓ Helm package manager
+          ✓ Basic storage class
+          
+          Next Steps:
+          1. Verify cluster: kubectl get nodes
+          2. Install applications: ansible-playbook playbooks/k3s-install-apps.yml
+          3. Check backups: ls -la /mnt/backup/
+          
+          Access cluster from master node:
+          ssh admin@{{ hostvars[groups['master'][0]]['ansible_host'] }}
+          kubectl get nodes

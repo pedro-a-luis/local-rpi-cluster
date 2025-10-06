@@ -1,0 +1,293 @@
+---
+# Setup Pi-hole Monitoring with Prometheus Exporter
+# This playbook installs pihole-exporter on both Pi-hole servers
+# and configures Prometheus to scrape metrics
+
+- name: Install Pi-hole Exporter
+  hosts: pihole
+  become: yes
+  vars:
+    exporter_version: "0.4.0"
+    exporter_user: "pihole-exporter"
+    exporter_port: "9617"
+
+  tasks:
+    - name: Display installation start
+      debug:
+        msg: |
+          =================================================
+          Installing Pi-hole Exporter: {{ inventory_hostname }}
+          =================================================
+          Version: {{ exporter_version }}
+          Port: {{ exporter_port }}
+          =================================================
+
+    - name: Create pihole-exporter user
+      user:
+        name: "{{ exporter_user }}"
+        system: yes
+        shell: /bin/false
+        home: /nonexistent
+        create_home: no
+
+    - name: Download pihole-exporter binary
+      get_url:
+        url: "https://github.com/eko/pihole-exporter/releases/download/v{{ exporter_version }}/pihole_exporter-linux-arm64"
+        dest: /usr/local/bin/pihole-exporter
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Create systemd service file
+      copy:
+        content: |
+          [Unit]
+          Description=Pi-hole Exporter
+          After=network.target pihole-FTL.service
+          Wants=pihole-FTL.service
+
+          [Service]
+          Type=simple
+          User={{ exporter_user }}
+          Group={{ exporter_user }}
+          ExecStart=/usr/local/bin/pihole-exporter \
+            -pihole_hostname 127.0.0.1 \
+            -pihole_port 80 \
+            -port {{ exporter_port }}
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/pihole-exporter.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start pihole-exporter
+      systemd:
+        name: pihole-exporter
+        enabled: yes
+        state: restarted
+
+    - name: Wait for exporter to start
+      wait_for:
+        port: "{{ exporter_port }}"
+        delay: 2
+        timeout: 30
+
+    - name: Test exporter endpoint
+      uri:
+        url: "http://127.0.0.1:{{ exporter_port }}/metrics"
+        return_content: yes
+      register: metrics_test
+      failed_when: "'pihole_' not in metrics_test.content"
+
+    - name: Display sample metrics
+      debug:
+        msg: "{{ metrics_test.content.split('\n')[:10] }}"
+
+    - name: Installation complete
+      debug:
+        msg: |
+          =================================================
+          Pi-hole Exporter Installed: {{ inventory_hostname }}
+          =================================================
+          Endpoint: http://{{ ansible_host }}:{{ exporter_port }}/metrics
+          Status: Running
+          =================================================
+
+- name: Configure Prometheus to scrape Pi-hole metrics
+  hosts: localhost
+  gather_facts: no
+  vars:
+    exporter_port: "9617"
+
+  tasks:
+    - name: Create Prometheus scrape config for Pi-holes
+      copy:
+        content: |
+          apiVersion: v1
+          kind: Endpoints
+          metadata:
+            name: pihole-metrics
+            namespace: monitoring
+            labels:
+              app: pihole-exporter
+          subsets:
+            - addresses:
+                - ip: 192.168.1.25
+                  targetRef:
+                    kind: Pod
+                    name: rpi-vpn-1
+                - ip: 192.168.1.26
+                  targetRef:
+                    kind: Pod
+                    name: rpi-vpn-2
+              ports:
+                - name: metrics
+                  port: {{ exporter_port }}
+                  protocol: TCP
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: pihole-metrics
+            namespace: monitoring
+            labels:
+              app: pihole-exporter
+          spec:
+            type: ClusterIP
+            clusterIP: None
+            ports:
+              - name: metrics
+                port: {{ exporter_port }}
+                targetPort: {{ exporter_port }}
+                protocol: TCP
+          ---
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: pihole-exporter
+            namespace: monitoring
+            labels:
+              app: pihole-exporter
+              release: kube-prometheus
+          spec:
+            endpoints:
+              - port: metrics
+                interval: 30s
+                path: /metrics
+            selector:
+              matchLabels:
+                app: pihole-exporter
+        dest: /tmp/pihole-servicemonitor.yaml
+
+    - name: Apply Prometheus configuration
+      shell: kubectl --kubeconfig=/home/admin/.kube/config apply -f /tmp/pihole-servicemonitor.yaml
+      delegate_to: 192.168.1.240
+      become_user: admin
+      register: kubectl_apply
+
+    - name: Display kubectl result
+      debug:
+        msg: "{{ kubectl_apply.stdout_lines }}"
+
+    - name: Create Grafana dashboard ConfigMap
+      copy:
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pihole-dashboard
+            namespace: monitoring
+            labels:
+              grafana_dashboard: "1"
+          data:
+            pihole-dashboard.json: |
+              {
+                "dashboard": {
+                  "title": "Pi-hole Monitoring",
+                  "tags": ["pihole", "dns"],
+                  "timezone": "browser",
+                  "panels": [
+                    {
+                      "title": "Total Queries",
+                      "targets": [
+                        {
+                          "expr": "pihole_queries_total",
+                          "legendFormat": "{{ instance }}"
+                        }
+                      ],
+                      "type": "graph",
+                      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+                    },
+                    {
+                      "title": "Blocked Queries",
+                      "targets": [
+                        {
+                          "expr": "pihole_blocked_queries_total",
+                          "legendFormat": "{{ instance }}"
+                        }
+                      ],
+                      "type": "graph",
+                      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+                    },
+                    {
+                      "title": "Block Percentage",
+                      "targets": [
+                        {
+                          "expr": "(pihole_blocked_queries_total / pihole_queries_total) * 100",
+                          "legendFormat": "{{ instance }}"
+                        }
+                      ],
+                      "type": "gauge",
+                      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+                    },
+                    {
+                      "title": "Domains on Blocklist",
+                      "targets": [
+                        {
+                          "expr": "pihole_domains_on_blocklist",
+                          "legendFormat": "{{ instance }}"
+                        }
+                      ],
+                      "type": "stat",
+                      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+                    }
+                  ]
+                }
+              }
+        dest: /tmp/pihole-dashboard.yaml
+
+    - name: Apply Grafana dashboard
+      shell: kubectl --kubeconfig=/home/admin/.kube/config apply -f /tmp/pihole-dashboard.yaml
+      delegate_to: 192.168.1.240
+      become_user: admin
+      register: dashboard_apply
+
+    - name: Display dashboard result
+      debug:
+        msg: "{{ dashboard_apply.stdout_lines }}"
+
+    - name: Final summary
+      debug:
+        msg: |
+          =================================================
+          PI-HOLE MONITORING SETUP COMPLETE
+          =================================================
+
+          Pi-hole Exporters:
+          - rpi-vpn-1: http://192.168.1.25:9617/metrics
+          - rpi-vpn-2: http://192.168.1.26:9617/metrics
+
+          Prometheus:
+          - ServiceMonitor created in monitoring namespace
+          - Scraping metrics every 30 seconds
+
+          Grafana:
+          - Dashboard: "Pi-hole Monitoring"
+          - Access: https://grafana.stratdata.org
+          - Metrics include:
+            * Total queries
+            * Blocked queries
+            * Block percentage
+            * Domains on blocklist
+            * DNS query types
+            * Top blocked domains
+            * Client statistics
+
+          Available Metrics:
+          - pihole_queries_total
+          - pihole_blocked_queries_total
+          - pihole_domains_on_blocklist
+          - pihole_ads_blocked_today
+          - pihole_dns_queries_today
+          - pihole_status (1=enabled, 0=disabled)
+          - And many more...
+
+          =================================================

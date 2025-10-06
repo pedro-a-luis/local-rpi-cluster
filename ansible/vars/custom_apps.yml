@@ -1,0 +1,102 @@
+---
+# ~/ansible/vars/custom_apps.yml - Custom application definitions for installation and removal
+
+apps:
+  # Sample web application
+  sample-webapp:
+    namespace: "webapp"
+    helm_release: ""  # Not using Helm
+    helm_chart: ""
+    manifest_method: true
+    manifest_file: "/home/admin/sample-webapp/deploy.yaml"
+    cleanup_resources:
+      - "deployments"
+      - "services"
+      - "configmaps"
+      - "ingress"
+    removal_timeout: 120
+    install_timeout: "180s"
+    dangerous: false
+    description: "Sample web application"
+    custom: true  # Mark as custom app
+    install: false  # Set to true when you want to install this app
+    
+  # Sample database
+  sample-database:
+    namespace: "db"
+    helm_release: "mysql"  # Using Helm chart
+    helm_chart: "bitnami/mysql"
+    helm_options: "--set auth.rootPassword=K3sRoot123 --set primary.persistence.size=4Gi"
+    manifest_method: false
+    install_timeout: "300s"
+    cleanup_resources:
+      - "statefulsets"
+      - "services"
+      - "persistentvolumeclaims"
+      - "configmaps"
+      - "secrets"
+    removal_timeout: 300
+    dangerous: true  # Mark as dangerous due to data loss potential
+    description: "MySQL database (CAUTION: Data will be lost on removal)"
+    custom: true  # Mark as custom app
+    install: false  # Set to true when you want to install this app
+    
+  # Example service mesh
+  service-mesh:
+    namespace: "istio-system"
+    helm_release: "istio"
+    helm_chart: "istio/base"
+    helm_options: ""
+    manifest_method: false
+    install_timeout: "600s"
+    cleanup_resources:
+      - "deployments"
+      - "services"
+      - "configmaps"
+      - "pods"
+      - "virtualservices"
+      - "gateways"
+    removal_timeout: 300
+    dangerous: false
+    description: "Istio Service Mesh"
+    custom: true  # Mark as custom app
+    install: false  # Set to true when you want to install this app
+
+  # GitLab Runner
+  gitlab-runner:
+    namespace: "gitlab-runner"
+    helm_release: "gitlab-runner"
+    helm_chart: "gitlab/gitlab-runner"
+    helm_options: "--set gitlabUrl=https://gitlab.com/ --set runnerRegistrationToken=YOUR_REGISTRATION_TOKEN"
+    manifest_method: false
+    install_timeout: "300s"
+    cleanup_resources:
+      - "deployments"
+      - "configmaps"
+      - "secrets"
+      - "serviceaccounts"
+    removal_timeout: 180
+    dangerous: false
+    description: "GitLab Runner for CI/CD pipelines"
+    custom: true
+    install: false  # Set to true when you want to install this app
+
+  # Postgresql Database
+  postgresql:
+    namespace: "postgresql"
+    helm_release: "postgresql"
+    helm_chart: "bitnami/postgresql"
+    helm_options: "--set auth.postgresPassword=K3sPostgres --set primary.persistence.size=2Gi"
+    manifest_method: false
+    install_timeout: "300s"
+    cleanup_resources:
+      - "statefulsets"
+      - "services"
+      - "persistentvolumeclaims"
+      - "configmaps"
+      - "secrets"
+    removal_timeout: 300
+    dangerous: true
+    description: "PostgreSQL database (CAUTION: Data will be lost on removal)"
+    custom: true
+    install: false  # Set to true when you want to install this app

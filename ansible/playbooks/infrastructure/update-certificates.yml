@@ -1,0 +1,85 @@
+---
+# Ansible Playbook: Update Let's Encrypt Certificates from Synology to K3s Cluster
+#
+# This playbook exports the Let's Encrypt wildcard certificate from Synology DS723+
+# and updates the TLS secrets in the Kubernetes cluster.
+#
+# Usage:
+#   ansible-playbook playbooks/update-certificates.yml
+#
+# Requirements:
+#   - sshpass installed
+#   - kubectl configured
+#   - Synology credentials
+
+- name: Update Let's Encrypt Certificates in K3s Cluster
+  hosts: localhost
+  gather_facts: no
+  vars:
+    synology_host: "192.168.1.20"
+    synology_user: "synology-ds723"
+    synology_password: "{{ lookup('env', 'SYNOLOGY_PASSWORD') | default('Xd9auP$W@eX3', true) }}"
+    cert_archive_id: "Yxt8vg"
+    cert_path: "/usr/syno/etc/certificate/_archive/{{ cert_archive_id }}"
+    namespaces:
+      - monitoring
+      - longhorn-system
+      - dev-tools
+    secret_name: "stratdata-wildcard-tls"
+
+  tasks:
+    - name: Create temporary directory for certificates
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: certs
+      register: temp_dir
+
+    - name: Export fullchain certificate from Synology
+      ansible.builtin.shell: |
+        sshpass -p '{{ synology_password }}' ssh -o StrictHostKeyChecking=no {{ synology_user }}@{{ synology_host }} \
+          'echo "{{ synology_password }}" | sudo -S cat {{ cert_path }}/fullchain.pem' > {{ temp_dir.path }}/fullchain.pem
+      no_log: true
+
+    - name: Export private key from Synology
+      ansible.builtin.shell: |
+        sshpass -p '{{ synology_password }}' ssh -o StrictHostKeyChecking=no {{ synology_user }}@{{ synology_host }} \
+          'echo "{{ synology_password }}" | sudo -S cat {{ cert_path }}/privkey.pem' > {{ temp_dir.path }}/privkey.pem
+      no_log: true
+
+    - name: Check certificate expiry
+      ansible.builtin.shell: |
+        openssl x509 -in {{ temp_dir.path }}/fullchain.pem -noout -dates
+      register: cert_dates
+
+    - name: Display certificate expiry
+      ansible.builtin.debug:
+        msg: "{{ cert_dates.stdout_lines }}"
+
+    - name: Update TLS secrets in namespaces
+      ansible.builtin.shell: |
+        kubectl delete secret {{ secret_name }} -n {{ item }} --ignore-not-found
+        kubectl create secret tls {{ secret_name }} -n {{ item }} \
+          --cert={{ temp_dir.path }}/fullchain.pem \
+          --key={{ temp_dir.path }}/privkey.pem
+      loop: "{{ namespaces }}"
+      register: secret_update
+
+    - name: Verify secrets created
+      ansible.builtin.shell: |
+        kubectl get secret {{ secret_name }} -n {{ item }} -o jsonpath='{.metadata.creationTimestamp}'
+      loop: "{{ namespaces }}"
+      register: secret_verify
+
+    - name: Display secret creation times
+      ansible.builtin.debug:
+        msg: "Secret {{ secret_name }} in {{ item.item }}: {{ item.stdout }}"
+      loop: "{{ secret_verify.results }}"
+
+    - name: Clean up temporary directory
+      ansible.builtin.file:
+        path: "{{ temp_dir.path }}"
+        state: absent
+
+    - name: Restart pods to pick up new certificates
+      ansible.builtin.debug:
+        msg: "Certificates updated. Pods will pick up new certs on restart or after cache refresh."

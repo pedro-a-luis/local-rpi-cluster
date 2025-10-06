@@ -1,0 +1,182 @@
+---
+# 3.8. K3s Node Preparation Playbook - ~/ansible/playbooks/k3s-prep-nodes.yml
+# This playbook configures node labels and ensures the cluster is ready for applications
+
+- name: Prepare K3s nodes for applications
+  hosts: master
+  become: yes
+  tasks:
+    - name: Verify K3s is running
+      command: systemctl is-active k3s
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if K3s not running
+      fail:
+        msg: "K3s must be active to configure nodes"
+      when: k3s_status.stdout != "active"
+
+    - name: Wait for nodes to be ready
+      shell: |
+        k3s kubectl get nodes | grep " Ready " | wc -l
+      register: ready_nodes
+      until: ready_nodes.stdout|int == groups['cluster']|length
+      retries: 10
+      delay: 30
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Display node status
+      shell: k3s kubectl get nodes
+      register: nodes_status
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Show node status
+      debug:
+        msg: "{{ nodes_status.stdout_lines }}"
+
+    - name: Label all nodes for Longhorn
+      shell: |
+        k3s kubectl label nodes --all pi=enabled --overwrite
+      changed_when: true
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Prepare nodes for storage
+      block:
+        - name: Check for Longhorn directory
+          stat:
+            path: /var/lib/longhorn
+          register: longhorn_dir
+          delegate_to: "{{ item }}"
+          delegate_facts: true
+          loop: "{{ groups['cluster'] }}"
+
+        - name: Create Longhorn data directory
+          file:
+            path: /var/lib/longhorn
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['cluster'] }}"
+          when: not hostvars[item].longhorn_dir.stat.exists
+
+    - name: Check required ports
+      block:
+        - name: Ensure required ports are allowed in firewall
+          shell: |
+            if command -v ufw >/dev/null 2>&1; then
+              # Setup rules for Longhorn
+              ufw allow 9500/tcp || true
+              # Setup rules for Prometheus/Grafana
+              ufw allow 9090/tcp || true
+              ufw allow 9100/tcp || true
+              ufw allow 3000/tcp || true
+              # Setup rules for Dashboard
+              ufw allow 30443/tcp || true
+              # Ingress rules
+              ufw allow 80/tcp || true
+              ufw allow 443/tcp || true
+            fi
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['cluster'] }}"
+          changed_when: false
+
+    - name: Setup node taints
+      block:
+        - name: Make worker nodes schedulable (remove taints)
+          shell: |
+            for node in $(k3s kubectl get nodes -l node.kubernetes.io/role=worker -o name); do
+              k3s kubectl taint nodes ${node#node/} node-role.kubernetes.io/worker- 2>/dev/null || true
+            done
+          changed_when: true
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Ensure master node is properly tainted
+          shell: |
+            master_node=$(k3s kubectl get nodes -l node.kubernetes.io/role=master -o name)
+            # Only taint if it doesn't already have the taint
+            if ! k3s kubectl get nodes ${master_node#node/} -o jsonpath='{.spec.taints[*].key}' | grep -q "node-role.kubernetes.io/master"; then
+              k3s kubectl taint nodes ${master_node#node/} node-role.kubernetes.io/master=true:NoSchedule
+            fi
+          changed_when: false
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Configure NFS StorageClass
+      block:
+        - name: Check if NFS provisioner already exists
+          shell: |
+            k3s kubectl get storageclass | grep nfs || echo "Not found"
+          register: nfs_sc
+          changed_when: false
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Install NFS provisioner Helm repo
+          shell: |
+            helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+            helm repo update
+          when: "'Not found' in nfs_sc.stdout"
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Install NFS provisioner
+          shell: |
+            helm upgrade --install nfs-subdir-external-provisioner \
+              nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+              --set nfs.server=192.168.1.10 \
+              --set nfs.path=/volume1/pi-cluster-data \
+              --create-namespace \
+              --namespace nfs-provisioner
+          when: "'Not found' in nfs_sc.stdout"
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Verify cluster readiness
+      shell: |
+        # Check coredns is running
+        coredns=$(k3s kubectl get deployments -n kube-system coredns -o jsonpath='{.status.readyReplicas}')
+        if [ "$coredns" -lt 1 ]; then
+          echo "CoreDNS not ready"
+          exit 1
+        fi
+        
+        # Check local-path provisioner is running
+        local_path=$(k3s kubectl get deployments -n kube-system local-path-provisioner -o jsonpath='{.status.readyReplicas}')
+        if [ "$local_path" -lt 1 ]; then
+          echo "Local-path provisioner not ready"
+          exit 1
+        fi
+        
+        echo "K3s core components are ready"
+        exit 0
+      register: readiness
+      until: readiness.rc == 0
+      retries: 5
+      delay: 15
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Display node preparation completion message
+      debug:
+        msg: |
+          Node preparation complete! The cluster is now ready for applications.
+          
+          Next steps:
+          1. Install applications with:
+             ansible-playbook playbooks/k3s-install-apps.yml -e "install_all=true"
+             
+          2. Or install specific applications with:
+             ansible-playbook playbooks/k3s-install-apps.yml -e "app_config=vars/custom_apps.yml"
+             
+          3. Verify your installation with:
+             kubectl get pods --all-namespaces

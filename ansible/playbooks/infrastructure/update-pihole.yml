@@ -1,0 +1,266 @@
+---
+# Update Pi-hole DNS Servers - ~/ansible/playbooks/infrastructure/update-pihole.yml
+# This playbook updates Pi-hole, OS packages, and WireGuard on both DNS servers
+# Servers: rpi-vpn-1 (192.168.1.25), rpi-vpn-2 (192.168.1.26)
+
+- name: Update Pi-hole DNS Servers
+  hosts: pihole
+  become: yes
+  serial: 1  # Update one at a time to maintain DNS availability
+  vars:
+    reboot_required: false
+
+  tasks:
+    - name: Display update start message
+      debug:
+        msg: |
+          =================================================
+          STARTING UPDATE: {{ inventory_hostname }}
+          =================================================
+          IP: {{ ansible_host }}
+          Role: {{ pihole_role }}
+          WireGuard: {{ wireguard_enabled }}
+          =================================================
+
+    - name: Check current system information
+      shell: |
+        echo "Hostname: $(hostname)"
+        echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+        echo "Kernel: $(uname -r)"
+        echo "Uptime: $(uptime -p)"
+        echo "Pi-hole version: $(pihole -v | grep 'Pi-hole version' | awk '{print $4}')"
+      register: system_info
+      changed_when: false
+
+    - name: Display current system info
+      debug:
+        msg: "{{ system_info.stdout_lines }}"
+
+    - name: Check Pi-hole status before update
+      shell: pihole status
+      register: pihole_status_before
+      changed_when: false
+      failed_when: false
+
+    - name: Display Pi-hole status
+      debug:
+        msg: "{{ pihole_status_before.stdout_lines }}"
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+      register: apt_update
+
+    - name: Check for available OS upgrades
+      shell: apt list --upgradable 2>/dev/null | grep -v "WARNING" | wc -l
+      register: upgradable_count
+      changed_when: false
+
+    - name: Display available OS upgrades
+      debug:
+        msg: "{{ upgradable_count.stdout }} OS packages available for upgrade"
+
+    - name: Show upgradable packages (first 20)
+      shell: apt list --upgradable 2>/dev/null | grep -v "WARNING" | head -20
+      register: upgradable_packages
+      changed_when: false
+      when: upgradable_count.stdout | int > 0
+
+    - name: Display upgradable packages
+      debug:
+        msg: "{{ upgradable_packages.stdout_lines }}"
+      when:
+        - upgradable_count.stdout | int > 0
+        - upgradable_packages is defined
+
+    - name: Upgrade all OS packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+        force_apt_get: yes
+      register: apt_upgrade
+      when: upgradable_count.stdout | int > 0
+
+    - name: Update Pi-hole
+      shell: pihole -up
+      register: pihole_update
+      changed_when: "'Everything is up to date' not in pihole_update.stdout"
+
+    - name: Display Pi-hole update result
+      debug:
+        msg: "{{ pihole_update.stdout_lines }}"
+
+    - name: Update Pi-hole gravity database
+      shell: pihole -g
+      register: gravity_update
+      changed_when: "'No changes detected' not in gravity_update.stdout"
+
+    - name: Display gravity update result
+      debug:
+        msg: "{{ gravity_update.stdout_lines }}"
+
+    - name: Check WireGuard status
+      shell: systemctl is-active wg-quick@wg0
+      register: wireguard_status
+      changed_when: false
+      failed_when: false
+      when: wireguard_enabled
+
+    - name: Display WireGuard status
+      debug:
+        msg: "WireGuard status: {{ wireguard_status.stdout }}"
+      when: wireguard_enabled
+
+    - name: Update WireGuard if installed
+      apt:
+        name: wireguard
+        state: latest
+      when: wireguard_enabled
+      register: wireguard_update
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Set reboot flag if needed
+      set_fact:
+        reboot_required: true
+      when: reboot_required_file.stat.exists
+
+    - name: Clean package cache
+      apt:
+        clean: yes
+
+    - name: Remove orphaned packages
+      apt:
+        autoremove: yes
+        purge: yes
+
+    - name: Check disk space after cleanup
+      shell: df -h / | tail -1
+      register: disk_space
+      changed_when: false
+
+    - name: Display disk space
+      debug:
+        msg: "Disk usage: {{ disk_space.stdout }}"
+
+    - name: Reboot if required
+      block:
+        - name: Display reboot warning
+          debug:
+            msg: |
+              =================================================
+              REBOOT REQUIRED: {{ inventory_hostname }}
+              =================================================
+              {{ pihole_role | upper }} DNS server will be
+              temporarily unavailable during reboot.
+
+              {{ 'Secondary DNS (rpi-vpn-2) will handle queries' if pihole_role == 'primary' else 'Primary DNS (rpi-vpn-1) will handle queries' }}
+              =================================================
+
+        - name: Pause before reboot
+          pause:
+            seconds: 5
+
+        - name: Reboot the system
+          reboot:
+            reboot_timeout: 300
+            connect_timeout: 60
+            pre_reboot_delay: 5
+            post_reboot_delay: 30
+            msg: "Rebooting {{ inventory_hostname }} after updates"
+
+        - name: Wait for system to come back online
+          wait_for_connection:
+            connect_timeout: 60
+            delay: 30
+
+      when: reboot_required
+
+    - name: Verify services after update
+      shell: |
+        echo "SSH: $(systemctl is-active ssh)"
+        echo "Pi-hole FTL: $(systemctl is-active pihole-FTL)"
+        echo "Pi-hole DNS: $(pihole status | grep -i 'dns service')"
+        {% if wireguard_enabled %}
+        echo "WireGuard: $(systemctl is-active wg-quick@wg0)"
+        {% endif %}
+      register: services_status
+      changed_when: false
+
+    - name: Display services status
+      debug:
+        msg: "{{ services_status.stdout_lines }}"
+
+    - name: Test DNS resolution
+      shell: |
+        echo "Testing local DNS resolution:"
+        nslookup grafana.stratdata.org 127.0.0.1 | grep -A1 "Name:" || echo "DNS test failed"
+      register: dns_test
+      changed_when: false
+      failed_when: false
+
+    - name: Display DNS test result
+      debug:
+        msg: "{{ dns_test.stdout_lines }}"
+
+    - name: Get Pi-hole statistics
+      shell: pihole -c -e
+      register: pihole_stats
+      changed_when: false
+
+    - name: Update completion summary
+      debug:
+        msg: |
+          =================================================
+          UPDATE COMPLETED: {{ inventory_hostname }}
+          =================================================
+          OS packages upgraded: {{ upgradable_count.stdout }}
+          Pi-hole updated: {{ 'Yes' if pihole_update.changed else 'Already up to date' }}
+          Gravity updated: {{ 'Yes' if gravity_update.changed else 'No changes' }}
+          {% if wireguard_enabled %}
+          WireGuard updated: {{ 'Yes' if wireguard_update.changed else 'Already up to date' }}
+          {% endif %}
+          Reboot required: {{ 'Yes (completed)' if reboot_required else 'No' }}
+
+          All services verified and running
+          =================================================
+
+- name: Final DNS health check
+  hosts: pihole
+  become: no
+  tasks:
+    - name: Query DNS from both servers
+      shell: nslookup grafana.stratdata.org {{ ansible_host }} | grep -A1 "Name:"
+      register: dns_check
+      changed_when: false
+      delegate_to: localhost
+      failed_when: false
+
+    - name: Display DNS health check
+      debug:
+        msg: "{{ inventory_hostname }} ({{ ansible_host }}): {{ dns_check.stdout_lines }}"
+
+    - name: Final summary
+      debug:
+        msg: |
+          =================================================
+          PI-HOLE UPDATE COMPLETE
+          =================================================
+          Both DNS servers updated and verified.
+
+          Primary DNS: rpi-vpn-1 (192.168.1.25)
+          Secondary DNS: rpi-vpn-2 (192.168.1.26)
+
+          RECOMMENDATIONS:
+          1. Verify DNS from clients: nslookup grafana.stratdata.org
+          2. Check Pi-hole admin panels:
+             http://192.168.1.25/admin
+             http://192.168.1.26/admin
+          3. Test WireGuard VPN connectivity
+          =================================================
+      run_once: true

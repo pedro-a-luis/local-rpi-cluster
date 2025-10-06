@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k3s-backup
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: alpine
+            command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache rsync && \
+              rsync -av /mnt/cluster-backup/k3s-backups/ {{ synology_ip }}:/volume1/pi-cluster-backup/k3s-backups/
+            volumeMounts:
+            - name: backup-volume
+              mountPath: /mnt/cluster-backup
+          restartPolicy: OnFailure
+          volumes:
+          - name: backup-volume
+            persistentVolumeClaim:
+              claimName: backup-pvc

@@ -1,0 +1,326 @@
+---
+# Complete Cluster Cleanup Playbook - ~/ansible/playbooks/complete-cleanup.yml
+# This playbook removes everything except Ansible itself
+# Reference: Section 2.7 and 3.x of documentation
+
+- name: Complete cleanup of Raspberry Pi cluster
+  hosts: cluster
+  become: yes
+  gather_facts: yes
+  vars:
+    force_cleanup: false  # Set to true to skip confirmations
+
+  tasks:
+    - name: Confirm cleanup operation
+      pause:
+        prompt: |
+          ============================================
+          WARNING: COMPLETE CLUSTER CLEANUP
+          ============================================
+          This will remove:
+          - K3s and all Kubernetes resources
+          - Docker (if installed)
+          - All container data
+          - All mounted shares
+          - All backup configurations
+          - All cluster configurations
+          
+          This will NOT remove:
+          - Ansible installation
+          - SSH keys
+          - Network configurations
+          - Base OS packages
+          
+          Type 'yes' to continue or Ctrl+C to abort
+      register: user_confirm
+      when: not force_cleanup
+
+    - name: Verify confirmation
+      fail:
+        msg: "Cleanup aborted by user"
+      when: 
+        - not force_cleanup
+        - user_confirm.user_input != 'yes'
+      delegate_to: localhost
+      run_once: true
+
+    # Stop services first
+    - name: Stop K3s service
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      ignore_errors: yes
+      with_items:
+        - k3s
+        - k3s-agent
+      
+    - name: Stop Docker service
+      systemd:
+        name: docker
+        state: stopped
+      ignore_errors: yes
+
+    # Kill any remaining k3s processes
+    - name: Kill k3s processes
+      shell: |
+        pkill -9 -f "k3s"
+        pkill -9 -f "containerd"
+        pkill -9 -f "kubectl"
+        pkill -9 -f "crictl"
+      ignore_errors: yes
+
+    # Uninstall K3s
+    - name: Run K3s uninstall script
+      shell: |
+        if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
+          /usr/local/bin/k3s-uninstall.sh
+        fi
+        if [ -f /usr/local/bin/k3s-agent-uninstall.sh ]; then
+          /usr/local/bin/k3s-agent-uninstall.sh
+        fi
+      ignore_errors: yes
+
+    # Remove K3s binaries and directories
+    - name: Remove K3s files and directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /usr/local/bin/k3s
+        - /usr/local/bin/kubectl
+        - /usr/local/bin/crictl
+        - /usr/local/bin/ctr
+        - /etc/rancher
+        - /var/lib/rancher
+        - /var/lib/kubelet
+        - /var/log/pods
+        - /var/log/containers
+        - /run/k3s
+        - /run/containerd
+        - /etc/cni/net.d
+        - /var/lib/cni
+        - /var/lib/calico
+        - /opt/cni/bin
+      ignore_errors: yes
+
+    # Clean up Docker
+    - name: Remove Docker packages
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: absent
+        purge: yes
+      ignore_errors: yes
+
+    - name: Remove Docker files and directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /var/lib/docker
+        - /etc/docker
+        - /usr/local/bin/docker-compose
+        - /var/run/docker.sock
+      ignore_errors: yes
+
+    # Unmount all NFS shares
+    - name: Get all NFS mounts
+      shell: mount | grep nfs | awk '{print $3}'
+      register: nfs_mounts
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Unmount NFS shares
+      mount:
+        path: "{{ item }}"
+        state: unmounted
+      with_items: "{{ nfs_mounts.stdout_lines }}"
+      when: nfs_mounts.stdout_lines | length > 0
+      ignore_errors: yes
+
+    - name: Remove NFS mount points
+      mount:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /mnt/backup
+        - /mnt/registry
+        - /mnt/shared-data
+        - /mnt/nfs-test
+      ignore_errors: yes
+
+    - name: Clean up fstab entries
+      lineinfile:
+        path: /etc/fstab
+        regexp: "{{ item }}"
+        state: absent
+      with_items:
+        - ".*nfs.*"
+        - ".*pi-cluster.*"
+        - ".*192.168.1.10.*"
+      ignore_errors: yes
+
+    - name: Remove mount directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /mnt/backup
+        - /mnt/registry
+        - /mnt/shared-data
+        - /mnt/nfs-test
+      ignore_errors: yes
+
+    # Remove backup scripts and cron jobs
+    - name: Remove backup scripts
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /usr/local/bin/backup-docker.sh
+        - /usr/local/bin/backup-docker-ssh.sh
+        - /usr/local/bin/backup-system.sh
+        - /usr/local/bin/backup-system-ssh.sh
+        - /usr/local/bin/backup-k3s.sh
+        - /usr/local/bin/backup-k3s-app-data.sh
+      ignore_errors: yes
+
+    - name: Remove all backup cron jobs
+      cron:
+        name: "{{ item }}"
+        state: absent
+      with_items:
+        - "Backup Docker data"
+        - "Backup Docker data via SSH"
+        - "Backup system configuration"
+        - "Backup system configuration via SSH"
+        - "Backup K3s cluster data"
+        - "Backup K3s application data"
+      ignore_errors: yes
+
+    # Clean up Helm
+    - name: Remove Helm installation
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /usr/local/bin/helm
+        - /root/.cache/helm
+        - /root/.config/helm
+        - /root/.local/share/helm
+      ignore_errors: yes
+
+    # Clean up cluster-related entries from hosts file
+    - name: Remove cluster entries from /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        regexp: "{{ item }}"
+        state: absent
+      with_items:
+        - ".*pi-master.*"
+        - ".*pi-worker.*"
+        - ".*cluster-registry.*"
+      ignore_errors: yes
+
+    # Clean up iptables rules
+    - name: Flush iptables rules
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+      ignore_errors: yes
+
+    # Clean up network interfaces
+    - name: Remove CNI network interfaces
+      shell: |
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete docker0 2>/dev/null || true
+        ip link delete vxlan.calico 2>/dev/null || true
+      ignore_errors: yes
+
+    # Remove any leftover container data
+    - name: Clean up container runtime data
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /var/lib/containerd
+        - /run/containerd
+        - /opt/containerd
+        - /var/lib/longhorn
+      ignore_errors: yes
+
+    # Clean package cache
+    - name: Clean apt cache
+      apt:
+        autoclean: yes
+        autoremove: yes
+      ignore_errors: yes
+
+    # Reset hostname if it was changed
+    - name: Reset hostname to default
+      hostname:
+        name: "raspberrypi"
+      when: inventory_hostname == "pi-master"
+      ignore_errors: yes
+
+    # Final cleanup
+    - name: Remove temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /tmp/k3s*
+        - /tmp/longhorn*
+        - /tmp/dashboard*
+        - /tmp/nginx*
+      ignore_errors: yes
+
+    - name: Reboot notification
+      debug:
+        msg: |
+          ============================================
+          CLEANUP COMPLETE
+          ============================================
+          The cluster has been completely removed.
+          
+          Remaining on the system:
+          - Ansible installation and configuration
+          - SSH keys and access
+          - Basic networking configuration
+          - Essential OS packages
+          
+          It is recommended to reboot all nodes:
+          ansible cluster -m reboot -b
+
+- name: Cleanup summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display final message
+      debug:
+        msg: |
+          ============================================
+          CLEANUP SUMMARY
+          ============================================
+          
+          All cluster components have been removed from:
+          {% for host in groups['cluster'] %}
+          - {{ host }} ({{ hostvars[host]['ansible_host'] }})
+          {% endfor %}
+          
+          To reboot all nodes, run:
+          ansible cluster -m reboot -b
+          
+          To reinstall the cluster, run:
+          ansible-playbook playbooks/complete-k3s-install.yml

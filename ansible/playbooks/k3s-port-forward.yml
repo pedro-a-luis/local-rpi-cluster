@@ -1,0 +1,96 @@
+---
+# 3.10. K3s Services Port Forwarding Setup - ~/ansible/playbooks/k3s-port-forward.yml
+# This playbook sets up port forwarding for accessing K3s services from outside the cluster
+
+- name: Set up port forwarding for K3s services
+  hosts: master
+  become: yes
+  vars:
+    services:
+      - name: "Prometheus"
+        namespace: "monitoring"
+        service: "prometheus-service"
+        port: "9090"
+        local_port: "9090"
+      - name: "Grafana"
+        namespace: "monitoring"
+        service: "grafana"
+        port: "3000"
+        local_port: "3000"
+      - name: "Longhorn UI"
+        namespace: "longhorn-system"
+        service: "longhorn-frontend"
+        port: "80"
+        local_port: "8000"
+  tasks:
+    - name: Stop any existing port-forward processes
+      shell: pkill -f "kubectl port-forward" || /bin/true
+      register: pkill_result
+      changed_when: pkill_result.rc == 0
+      failed_when: false
+      
+    - name: Install socat for port forwarding
+      apt:
+        name: socat
+        state: present
+        
+    - name: Create port-forward script
+      copy:
+        dest: /usr/local/bin/start-k3s-port-forwarding.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          
+          # Kill any existing port-forwards
+          pkill -f "kubectl port-forward" > /dev/null 2>&1 || true
+          
+          # Start port forwarding in the background
+          {% for svc in services %}
+          echo "Starting port forward for {{ svc.name }} on port {{ svc.local_port }}"
+          nohup kubectl port-forward -n {{ svc.namespace }} svc/{{ svc.service }} {{ svc.local_port }}:{{ svc.port }} --address 0.0.0.0 > /tmp/port-forward-{{ svc.name | lower }}.log 2>&1 &
+          {% endfor %}
+          
+          echo "Port forwarding started. Services are available at:"
+          {% for svc in services %}
+          echo "{{ svc.name }}: http://$(hostname -I | awk '{print $1}'):{{ svc.local_port }}"
+          {% endfor %}
+          
+          echo "To stop port forwarding, run: pkill -f 'kubectl port-forward'"
+
+    - name: Create stop port-forward script
+      copy:
+        dest: /usr/local/bin/stop-k3s-port-forwarding.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          
+          echo "Stopping all port-forwarding processes..."
+          pkill -f "kubectl port-forward" > /dev/null 2>&1 && echo "Port forwarding stopped" || echo "No port-forwarding processes found"
+
+    - name: Start port forwarding
+      shell: /usr/local/bin/start-k3s-port-forwarding.sh
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: port_forward_result
+      changed_when: true
+      
+    - name: Display port forwarding information
+      debug:
+        msg: |
+          Port forwarding has been set up on the master node.
+          
+          To access services from your local machine, use SSH tunneling:
+          
+          Run these commands on your local laptop (not on the cluster):
+          
+          {% for svc in services %}
+          # For {{ svc.name }}:
+          ssh -L {{ svc.local_port }}:localhost:{{ svc.local_port }} admin@{{ ansible_host }}
+          # Then access in your browser: http://localhost:{{ svc.local_port }}
+          
+          {% endfor %}
+          You can also set up a more persistent SSH tunnel with:
+          ssh -N -L 9090:localhost:9090 -L 3000:localhost:3000 -L 8000:localhost:8000 admin@{{ ansible_host }}
+          
+          To stop port forwarding on the master node:
+          ssh admin@{{ ansible_host }} "sudo /usr/local/bin/stop-k3s-port-forwarding.sh"

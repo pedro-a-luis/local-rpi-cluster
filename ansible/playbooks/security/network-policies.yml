@@ -1,0 +1,374 @@
+---
+# Ansible Playbook: Deploy Network Policies for All Namespaces
+#
+# This playbook creates network policies implementing zero-trust networking.
+#
+# Usage:
+#   kubectl apply -f playbooks/security/network-policies.yml
+#
+# Note: This is a Kubernetes manifest, not an Ansible playbook.
+# Apply with: kubectl apply -f <this-file>
+
+apiVersion: v1
+kind: List
+items:
+
+# Default namespace - deny all, then allow specific
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: default-deny-all
+    namespace: default
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+
+# Monitoring namespace policies
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: default-deny-all
+    namespace: monitoring
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: prometheus-allow
+    namespace: monitoring
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: prometheus
+    policyTypes:
+    - Ingress
+    - Egress
+    ingress:
+    # Allow from Grafana
+    - from:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: grafana
+      ports:
+      - protocol: TCP
+        port: 9090
+    # Allow from Traefik (if exposed)
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+      ports:
+      - protocol: TCP
+        port: 9090
+    egress:
+    # Allow to K8s API
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: default
+      ports:
+      - protocol: TCP
+        port: 443
+    # Allow to node exporters
+    - to:
+      - namespaceSelector: {}
+      ports:
+      - protocol: TCP
+        port: 9100
+    # Allow to all pods for scraping
+    - to:
+      - namespaceSelector: {}
+    # Allow DNS
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+      ports:
+      - protocol: UDP
+        port: 53
+
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: grafana-allow
+    namespace: monitoring
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: grafana
+    policyTypes:
+    - Ingress
+    - Egress
+    ingress:
+    # Allow from Traefik ingress
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+      ports:
+      - protocol: TCP
+        port: 3000
+    egress:
+    # Allow to Prometheus
+    - to:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+      ports:
+      - protocol: TCP
+        port: 9090
+    # Allow to Loki (if in logging namespace)
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: logging
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: loki
+      ports:
+      - protocol: TCP
+        port: 3100
+    # Allow DNS
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+      ports:
+      - protocol: UDP
+        port: 53
+    # Allow to PostgreSQL (if used)
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: databases
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: postgresql
+      ports:
+      - protocol: TCP
+        port: 5432
+
+# Logging namespace policies
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: default-deny-all
+    namespace: logging
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: loki-allow
+    namespace: logging
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: loki
+    policyTypes:
+    - Ingress
+    - Egress
+    ingress:
+    # Allow from Grafana
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: grafana
+      ports:
+      - protocol: TCP
+        port: 3100
+    # Allow from Promtail
+    - from:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: promtail
+      ports:
+      - protocol: TCP
+        port: 3100
+    egress:
+    # Allow to storage (NFS, etc.)
+    - to:
+      - namespaceSelector: {}
+      ports:
+      - protocol: TCP
+        port: 2049
+    # Allow DNS
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+      ports:
+      - protocol: UDP
+        port: 53
+
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: promtail-allow
+    namespace: logging
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: promtail
+    policyTypes:
+    - Ingress
+    - Egress
+    egress:
+    # Allow to Loki
+    - to:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: loki
+      ports:
+      - protocol: TCP
+        port: 3100
+    # Allow DNS
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+      ports:
+      - protocol: UDP
+        port: 53
+
+# Longhorn namespace - needs broad access for storage
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: longhorn-allow-all
+    namespace: longhorn-system
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+    ingress:
+    - {}
+    egress:
+    - {}
+
+# Dev-tools namespace
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: default-deny-all
+    namespace: dev-tools
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: codeserver-allow
+    namespace: dev-tools
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: codeserver
+    policyTypes:
+    - Ingress
+    - Egress
+    ingress:
+    # Allow from Traefik
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+      ports:
+      - protocol: TCP
+        port: 8080
+    egress:
+    # Allow all egress for code-server (needs internet, K8s API, etc.)
+    - {}
+
+# Cert-manager namespace
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: cert-manager-allow
+    namespace: cert-manager
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+    egress:
+    # Allow to K8s API
+    - to:
+      - namespaceSelector: {}
+        podSelector: {}
+      ports:
+      - protocol: TCP
+        port: 443
+    # Allow to internet for ACME
+    - to:
+      - namespaceSelector: {}
+      ports:
+      - protocol: TCP
+        port: 443
+      - protocol: TCP
+        port: 80
+    # Allow DNS
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+      ports:
+      - protocol: UDP
+        port: 53
+
+# kube-system - allow all (system namespace)
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: kube-system-allow-all
+    namespace: kube-system
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    - Egress
+    ingress:
+    - {}
+    egress:
+    - {}

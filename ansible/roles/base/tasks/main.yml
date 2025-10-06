@@ -1,0 +1,28 @@
+- name: Set hostname
+  hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Configure /etc/hosts
+  template:
+    src: hosts.j2
+    dest: /etc/hosts
+    mode: '0644'
+
+- name: Install base packages
+  apt:
+   # name: "{{ base_packages }}"
+    name: "{{ base_packages | default(['vim', 'htop', 'tmux', 'git', 'chrony', 'nfs-common']) }}"
+    update_cache: yes
+
+- name: Configure timezone
+  timezone:
+    name: "{{ timezone | default('UTC') }}"
+
+- name: Enable cgroups
+  lineinfile:
+    path: /boot/firmware/cmdline.txt
+    regexp: '(^.*$)(?<!cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory)'
+    line: '\1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory'
+    backrefs: yes
+  notify: "reboot system"
+

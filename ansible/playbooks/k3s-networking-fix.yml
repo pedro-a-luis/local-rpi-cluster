@@ -1,0 +1,209 @@
+---
+# 3.10. K3s Networking and Access Troubleshooting - ~/ansible/playbooks/k3s-networking-fix.yml
+# This playbook diagnoses and fixes issues with accessing K3s services
+
+- name: Diagnose and fix K3s service access
+  hosts: master
+  become: yes
+  vars:
+    master_ip: "{{ hostvars[groups['master'][0]]['ansible_host'] }}"
+  tasks:
+    - name: Check ingress controller status
+      shell: k3s kubectl get pods -n ingress-nginx
+      register: ingress_pods
+      changed_when: false
+      
+    - name: Display ingress controller status
+      debug:
+        msg: "{{ ingress_pods.stdout_lines }}"
+        
+    - name: Check if ingress controller is working correctly
+      shell: k3s kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=20
+      register: ingress_logs
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display ingress controller logs
+      debug:
+        msg: "{{ ingress_logs.stdout_lines | default(['No logs available']) }}"
+        
+    - name: Check if ingress resources exist
+      shell: k3s kubectl get ingress --all-namespaces
+      register: ingress_resources
+      changed_when: false
+      
+    - name: Display ingress resources
+      debug:
+        msg: "{{ ingress_resources.stdout_lines }}"
+        
+    - name: Check node port services
+      shell: k3s kubectl get services --all-namespaces -o wide | grep NodePort
+      register: nodeport_services
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display nodeport services
+      debug:
+        msg: "{{ nodeport_services.stdout_lines | default(['No NodePort services found']) }}"
+        
+    - name: Test network connectivity (localhost)
+      shell: curl -s -o /dev/null -w "%{http_code}" http://localhost:80
+      register: local_curl
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display local connectivity result
+      debug:
+        msg: "HTTP status code for localhost: {{ local_curl.stdout | default('Connection failed') }}"
+        
+    - name: Verify hostnames in /etc/hosts
+      shell: grep "{{ master_ip }}" /etc/hosts || echo "Not found"
+      register: hosts_file
+      changed_when: false
+      
+    - name: Display hosts file entries
+      debug:
+        msg: "Host entries: {{ hosts_file.stdout_lines }}"
+    
+    # Convert ingress to NodePort for Grafana
+    - name: Create Grafana NodePort service
+      copy:
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: grafana-nodeport
+            namespace: monitoring
+          spec:
+            type: NodePort
+            ports:
+            - port: 3000
+              targetPort: 3000
+              nodePort: 30080
+              protocol: TCP
+            selector:
+              app: grafana
+        dest: /tmp/grafana-nodeport.yaml
+        
+    - name: Apply Grafana NodePort service
+      shell: k3s kubectl apply -f /tmp/grafana-nodeport.yaml
+      register: grafana_nodeport_result
+      changed_when: grafana_nodeport_result.rc == 0
+      ignore_errors: yes
+      
+    # Convert ingress to NodePort for Prometheus
+    - name: Create Prometheus NodePort service
+      copy:
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: prometheus-nodeport
+            namespace: monitoring
+          spec:
+            type: NodePort
+            ports:
+            - port: 9090
+              targetPort: 9090
+              nodePort: 30090
+              protocol: TCP
+            selector:
+              app: prometheus-server
+        dest: /tmp/prometheus-nodeport.yaml
+        
+    - name: Apply Prometheus NodePort service
+      shell: k3s kubectl apply -f /tmp/prometheus-nodeport.yaml
+      register: prometheus_nodeport_result
+      changed_when: prometheus_nodeport_result.rc == 0
+      ignore_errors: yes
+      
+    # Setup direct port-forwarding as a fallback option
+    - name: Create port-forwarding script for Grafana
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Starting port-forward for Grafana on port 3000..."
+          nohup kubectl port-forward -n monitoring svc/grafana 3000:3000 --address 0.0.0.0 > /dev/null 2>&1 &
+          echo "Grafana should now be accessible at http://{{ master_ip }}:3000"
+        dest: /home/admin/start-grafana-port-forward.sh
+        mode: '0755'
+        owner: admin
+        group: admin
+        
+    - name: Create port-forwarding script for Prometheus
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Starting port-forward for Prometheus on port 9090..."
+          nohup kubectl port-forward -n monitoring svc/prometheus-service 9090:9090 --address 0.0.0.0 > /dev/null 2>&1 &
+          echo "Prometheus should now be accessible at http://{{ master_ip }}:9090"
+        dest: /home/admin/start-prometheus-port-forward.sh
+        mode: '0755'
+        owner: admin
+        group: admin
+        
+    - name: Create port-forwarding script for Longhorn
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Starting port-forward for Longhorn UI on port 8000..."
+          nohup kubectl port-forward -n longhorn-system svc/longhorn-frontend 8000:80 --address 0.0.0.0 > /dev/null 2>&1 &
+          echo "Longhorn UI should now be accessible at http://{{ master_ip }}:8000"
+        dest: /home/admin/start-longhorn-port-forward.sh
+        mode: '0755'
+        owner: admin
+        group: admin
+        
+    - name: Check nodes allow traffic 
+      shell: iptables -L INPUT | grep ACCEPT
+      register: iptables_check
+      changed_when: false
+      
+    - name: Display firewall rules
+      debug:
+        msg: "{{ iptables_check.stdout_lines }}"
+        
+    - name: Display access options
+      debug:
+        msg: |
+          -------------------------------------------------------
+          SERVICE ACCESS OPTIONS
+          -------------------------------------------------------
+          
+          OPTION 1: NodePort Services (recommended)
+          -----------------------------------------
+          Grafana:    http://{{ master_ip }}:30080
+                      Username: admin
+                      Password: admin123
+                      
+          Prometheus: http://{{ master_ip }}:30090
+          
+          
+          OPTION 2: Port-Forwarding Scripts
+          ---------------------------------
+          For Grafana:
+          ssh admin@{{ master_ip }} "~/start-grafana-port-forward.sh"
+          Then access: http://{{ master_ip }}:3000
+          
+          For Prometheus:
+          ssh admin@{{ master_ip }} "~/start-prometheus-port-forward.sh"
+          Then access: http://{{ master_ip }}:9090
+          
+          For Longhorn UI:
+          ssh admin@{{ master_ip }} "~/start-longhorn-port-forward.sh"
+          Then access: http://{{ master_ip }}:8000
+          
+          
+          OPTION 3: Local Port Forwarding via SSH
+          --------------------------------------
+          Grafana:
+          ssh -L 3000:localhost:3000 admin@{{ master_ip }} "kubectl port-forward -n monitoring svc/grafana 3000:3000"
+          Then access: http://localhost:3000
+          
+          Prometheus:
+          ssh -L 9090:localhost:9090 admin@{{ master_ip }} "kubectl port-forward -n monitoring svc/prometheus-service 9090:9090"
+          Then access: http://localhost:9090
+          
+          Longhorn:
+          ssh -L 8000:localhost:8000 admin@{{ master_ip }} "kubectl port-forward -n longhorn-system svc/longhorn-frontend 8000:80"
+          Then access: http://localhost:8000

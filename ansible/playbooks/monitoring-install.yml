@@ -1,0 +1,214 @@
+---
+# 3.4. Prometheus and Grafana Monitoring Installation - ~/ansible/playbooks/monitoring-install.yml
+# This playbook installs Prometheus and Grafana for monitoring the K3s cluster
+
+- name: Deploy Prometheus and Grafana
+  hosts: master
+  become: yes
+  vars:
+    kube_prometheus_stack_version: "55.5.0"  # Recent stable version
+    monitoring_namespace: "monitoring"
+  tasks:
+    - name: Check if Helm is installed
+      command: which helm
+      register: helm_check
+      ignore_errors: yes
+      changed_when: false
+      
+    - name: Install Helm if not present
+      shell: |
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod 700 get_helm.sh
+        ./get_helm.sh
+        rm get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+      when: helm_check.rc != 0
+        
+    - name: Add Prometheus Helm repository
+      shell: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      args:
+        executable: /bin/bash
+      register: helm_repo_add
+      changed_when: "'has been added to your repositories' in helm_repo_add.stderr"
+      
+    - name: Update Helm repositories
+      shell: helm repo update
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Create monitoring namespace
+      shell: k3s kubectl create namespace {{ monitoring_namespace }} --dry-run=client -o yaml | k3s kubectl apply -f -
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Check if Prometheus is already installed
+      shell: k3s kubectl get deployment -n {{ monitoring_namespace }} prometheus-operator-kube-p-operator 2>/dev/null || echo "NotFound"
+      register: prometheus_check
+      changed_when: false
+
+    - name: Create Prometheus values file
+      copy:
+        content: |
+          defaultRules:
+            create: true
+            rules:
+              alertmanager: true
+              etcd: true
+              general: true
+              k8s: true
+              kubeApiserver: true
+              kubeScheduler: true
+              kubeStateMetrics: true
+              kubelet: true
+              kubernetesApps: true
+              kubernetesResources: true
+              kubernetesStorage: true
+              kubernetesSystem: true
+              node: true
+              prometheusOperator: true
+
+          alertmanager:
+            enabled: true
+            resources:
+              limits:
+                cpu: 200m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+
+          grafana:
+            enabled: true
+            ingress:
+              enabled: true
+              ingressClassName: nginx
+              hosts:
+                - grafana.{{ hostvars[groups['master'][0]]['ansible_host'] }}.nip.io
+            adminPassword: admin123
+            persistence:
+              enabled: true
+              storageClassName: longhorn
+              size: 10Gi
+            resources:
+              limits:
+                cpu: 300m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            dashboardProviders:
+              dashboardproviders.yaml:
+                apiVersion: 1
+                providers:
+                - name: 'default'
+                  orgId: 1
+                  folder: ''
+                  type: file
+                  disableDeletion: false
+                  editable: true
+                  options:
+                    path: /var/lib/grafana/dashboards/default
+
+          kubeStateMetrics:
+            enabled: true
+
+          nodeExporter:
+            enabled: true
+
+          prometheus:
+            enabled: true
+            ingress:
+              enabled: true
+              ingressClassName: nginx
+              hosts:
+                - prometheus.{{ hostvars[groups['master'][0]]['ansible_host'] }}.nip.io
+            prometheusSpec:
+              retention: 10d
+              resources:
+                limits:
+                  cpu: 400m
+                  memory: 2Gi
+                requests:
+                  cpu: 200m
+                  memory: 1Gi
+              storageSpec:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: longhorn
+                    accessModes: ["ReadWriteOnce"]
+                    resources:
+                      requests:
+                        storage: 20Gi
+          
+          prometheusOperator:
+            enabled: true
+            resources:
+              limits:
+                cpu: 200m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+        dest: /tmp/prometheus-values.yaml
+      when: "'NotFound' in prometheus_check.stdout"
+      
+    - name: Install kube-prometheus-stack using Helm
+      shell: >
+        KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        helm install prometheus-stack prometheus-community/kube-prometheus-stack 
+        --namespace {{ monitoring_namespace }}
+        --version {{ kube_prometheus_stack_version }}
+        -f /tmp/prometheus-values.yaml
+      args:
+        executable: /bin/bash
+      when: "'NotFound' in prometheus_check.stdout"
+      register: helm_install
+      changed_when: helm_install.rc == 0
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      
+    - name: Wait for Prometheus Operator deployment to be ready
+      shell: >
+        k3s kubectl rollout status deployment/prometheus-stack-kube-prom-operator
+        -n {{ monitoring_namespace }} --timeout=900s
+      args:
+        executable: /bin/bash
+      when: "'NotFound' in prometheus_check.stdout"
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Wait for Grafana deployment to be ready
+      shell: >
+        k3s kubectl rollout status deployment/prometheus-stack-grafana
+        -n {{ monitoring_namespace }} --timeout=900s
+      args:
+        executable: /bin/bash
+      when: "'NotFound' in prometheus_check.stdout"
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Verify Prometheus and Grafana are running
+      shell: k3s kubectl get pods -n {{ monitoring_namespace }}
+      register: monitoring_pods
+      changed_when: false
+      
+    - name: Display monitoring pod status
+      debug:
+        msg: "{{ monitoring_pods.stdout_lines }}"
+        
+    - name: Get Grafana admin password
+      shell: k3s kubectl get secret -n {{ monitoring_namespace }} prometheus-stack-grafana -o jsonpath="{.data.admin-password}" | base64 --decode
+      register: grafana_password
+      changed_when: false
+      
+    - name: Display Grafana access information
+      debug:
+        msg: |
+          Grafana is available at: http://grafana.{{ hostvars[groups['master'][0]]['ansible_host'] }}.nip.io
+          Username: admin
+          Password: {{ grafana_password.stdout }}
+          
+          Prometheus is available at: http://prometheus.{{ hostvars[groups['master'][0]]['ansible_host'] }}.nip.io

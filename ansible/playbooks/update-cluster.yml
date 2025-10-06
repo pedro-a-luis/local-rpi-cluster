@@ -1,0 +1,267 @@
+---
+# Update All Raspberry Pi Nodes - ~/ansible/playbooks/update-cluster.yml
+# This playbook updates and upgrades all Raspberry Pi nodes in the cluster
+# Compatible with Raspberry Pi OS 12 'Bookworm'
+
+- name: Update and upgrade all Raspberry Pi nodes
+  hosts: cluster
+  become: yes
+  serial: 2  # Update 2 nodes at a time to maintain cluster availability
+  vars:
+    reboot_required: false
+    firmware_update: false
+    
+  tasks:
+    - name: Display update start message
+      debug:
+        msg: "Starting update process for {{ inventory_hostname }} ({{ ansible_host }})"
+
+    - name: Check current system information
+      shell: |
+        echo "Hostname: $(hostname)"
+        echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+        echo "Kernel: $(uname -r)"
+        echo "Uptime: $(uptime -p)"
+        echo "Load: $(uptime | awk -F'load average:' '{print $2}')"
+      register: system_info
+      changed_when: false
+
+    - name: Display current system info
+      debug:
+        msg: "{{ system_info.stdout_lines }}"
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 0  # Force cache update
+      register: apt_update
+      
+    - name: Check for available upgrades
+      shell: apt list --upgradable 2>/dev/null | grep -v "WARNING" | wc -l
+      register: upgradable_count
+      changed_when: false
+      
+    - name: Display available upgrades
+      debug:
+        msg: "{{ upgradable_count.stdout }} packages available for upgrade on {{ inventory_hostname }}"
+
+    - name: Show upgradable packages (first 20)
+      shell: apt list --upgradable 2>/dev/null | grep -v "WARNING" | head -20
+      register: upgradable_packages
+      changed_when: false
+      when: upgradable_count.stdout | int > 0
+      
+    - name: Display upgradable packages
+      debug:
+        msg: "Available upgrades:\n{{ upgradable_packages.stdout }}"
+      when: 
+        - upgradable_count.stdout | int > 0
+        - upgradable_packages is defined
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+        force_apt_get: yes
+      register: apt_upgrade
+      when: upgradable_count.stdout | int > 0
+      
+    - name: Display upgrade results
+      debug:
+        msg: |
+          Package upgrade completed on {{ inventory_hostname }}
+          Packages upgraded: {{ upgradable_count.stdout }}
+          {% if apt_upgrade.changed %}
+          Upgrade successful
+          {% else %}
+          No changes made
+          {% endif %}
+      when: upgradable_count.stdout | int > 0
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Set reboot flag if needed
+      set_fact:
+        reboot_required: true
+      when: reboot_required_file.stat.exists
+
+    - name: Check for firmware updates (Raspberry Pi specific)
+      shell: |
+        if command -v rpi-update >/dev/null 2>&1; then
+          echo "rpi-update available"
+          # Check if firmware update is available (this is safe, just checks)
+          rpi-update -y 2>&1 | grep -i "already up to date" || echo "firmware_update_available"
+        else
+          echo "rpi-update not available"
+        fi
+      register: firmware_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display firmware status
+      debug:
+        msg: "{{ firmware_check.stdout_lines }}"
+      when: firmware_check is defined
+
+    - name: Update firmware if available and requested
+      shell: rpi-update -y
+      register: firmware_update_result
+      when: 
+        - firmware_update | bool
+        - "'firmware_update_available' in firmware_check.stdout"
+      
+    - name: Set reboot flag for firmware update
+      set_fact:
+        reboot_required: true
+      when: 
+        - firmware_update | bool  
+        - firmware_update_result is defined
+        - firmware_update_result.changed
+
+    - name: Clean package cache
+      apt:
+        clean: yes
+        
+    - name: Remove orphaned packages
+      apt:
+        autoremove: yes
+        purge: yes
+
+    - name: Check disk space after cleanup
+      shell: df -h /
+      register: disk_space
+      changed_when: false
+      
+    - name: Display disk space
+      debug:
+        msg: "Disk usage after cleanup on {{ inventory_hostname }}:\n{{ disk_space.stdout }}"
+
+    - name: Check system services status
+      shell: |
+        echo "Docker: $(systemctl is-active docker 2>/dev/null || echo 'not-installed')"
+        echo "K3s: $(systemctl is-active k3s 2>/dev/null || echo 'not-installed')"
+        echo "SSH: $(systemctl is-active ssh)"
+        echo "Networking: $(systemctl is-active systemd-networkd || systemctl is-active networking)"
+      register: services_status
+      changed_when: false
+      
+    - name: Display services status
+      debug:
+        msg: "{{ services_status.stdout_lines }}"
+
+    - name: Pause before reboot (worker nodes)
+      pause:
+        prompt: |
+          {{ inventory_hostname }} requires a reboot to complete updates.
+          
+          Services that will be affected:
+          {% if 'master' in group_names %}
+          - K3s control plane (cluster may become temporarily unavailable)
+          {% else %}
+          - K3s worker (pods may be rescheduled)
+          {% endif %}
+          - Running containers/pods
+          
+          Press Enter to continue with reboot, or Ctrl+C to skip
+      when: 
+        - reboot_required
+        - not automated_reboot | default(false)
+
+    - name: Reboot the system if required
+      reboot:
+        reboot_timeout: 300
+        connect_timeout: 60
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        msg: "Rebooting {{ inventory_hostname }} after system updates"
+      when: reboot_required
+      
+    - name: Wait for system to come back online
+      wait_for_connection:
+        connect_timeout: 60
+        delay: 30
+      when: reboot_required
+
+    - name: Verify system after reboot
+      block:
+        - name: Check system status after reboot
+          shell: |
+            echo "Hostname: $(hostname)"
+            echo "Kernel: $(uname -r)"
+            echo "Uptime: $(uptime -p)"
+            echo "Load: $(uptime | awk -F'load average:' '{print $2}')"
+          register: post_reboot_info
+          changed_when: false
+          
+        - name: Display post-reboot status
+          debug:
+            msg: "{{ post_reboot_info.stdout_lines }}"
+            
+        - name: Check critical services after reboot
+          shell: |
+            echo "SSH: $(systemctl is-active ssh)"
+            echo "Docker: $(systemctl is-active docker 2>/dev/null || echo 'not-installed')"
+            echo "K3s: $(systemctl is-active k3s 2>/dev/null || echo 'not-installed')"
+          register: post_reboot_services
+          changed_when: false
+          
+        - name: Display post-reboot services
+          debug:
+            msg: "{{ post_reboot_services.stdout_lines }}"
+            
+      when: reboot_required
+
+    - name: Update completion summary
+      debug:
+        msg: |
+          =================================================
+          UPDATE COMPLETED: {{ inventory_hostname }}
+          =================================================
+          Initial packages to upgrade: {{ upgradable_count.stdout }}
+          Reboot required: {{ 'Yes' if reboot_required else 'No' }}
+          {% if reboot_required %}
+          System rebooted and services verified
+          {% endif %}
+          
+          Next: Run k3s validation if this is a K3s node
+          =================================================
+
+- name: Final cluster status check
+  hosts: master
+  become: no
+  tasks:
+    - name: Wait for K3s to be ready (if installed)
+      shell: |
+        if systemctl is-active k3s >/dev/null 2>&1; then
+          echo "K3s is active, checking cluster status..."
+          timeout 60 sh -c 'until k3s kubectl get nodes >/dev/null 2>&1; do sleep 2; done'
+          k3s kubectl get nodes -o wide
+        else
+          echo "K3s not installed or not active"
+        fi
+      register: k3s_status
+      changed_when: false
+      ignore_errors: yes
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+        
+    - name: Display final cluster status
+      debug:
+        msg: |
+          =================================================
+          CLUSTER UPDATE COMPLETED
+          =================================================
+          
+          {{ k3s_status.stdout_lines | join('\n') }}
+          
+          RECOMMENDATIONS:
+          1. Run k3s validation: ansible-playbook playbooks/k3s-validate.yml
+          2. Check application status: kubectl get pods --all-namespaces
+          3. Verify NFS mounts: ansible cluster -m shell -a "mount | grep nfs"
+          
+          =================================================
+      when: k3s_status is defined

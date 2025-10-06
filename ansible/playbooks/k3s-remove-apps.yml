@@ -1,0 +1,342 @@
+---
+# 3.10. K3s Application Removal Playbook - ~/ansible/playbooks/k3s-remove-apps.yml
+# This playbook removes applications from the K3s cluster with a streamlined approach
+
+- name: Remove applications from K3s cluster
+  hosts: master
+  become: yes
+  vars:
+    # Control flags - set these when calling the playbook
+    remove_all: no               # Set to yes to remove all default apps
+    remove_custom: no            # Set to yes to remove all custom apps
+    automated_removal: no        # Set to yes to skip safety confirmations
+    
+    # App selection - specify specific apps to remove
+    # Format: { app_name: yes, another_app: yes }
+    selected_apps: {}
+    
+  tasks:
+    # Load the default app definitions
+    - name: Load default application definitions
+      include_vars:
+        file: "../vars/main.yml"
+        
+    # Optional: Load custom app definitions if they exist
+    - name: Check if custom apps file exists
+      stat:
+        path: "../vars/custom_apps.yml"
+      register: custom_apps_file
+        
+    - name: Load custom application definitions
+      include_vars:
+        file: "../vars/custom_apps.yml"
+        name: custom_apps
+      when: custom_apps_file.stat.exists
+      
+    # Merge custom apps into main apps if needed
+    - name: Add custom apps to main apps list
+      set_fact:
+        apps: "{{ apps | combine(custom_apps.apps) }}"
+      when: custom_apps_file.stat.exists and custom_apps is defined
+
+    # Verify K3s is running
+    - name: Verify K3s is running
+      command: systemctl is-active k3s
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if K3s not running
+      fail:
+        msg: "K3s must be active to remove applications"
+      when: k3s_status.stdout != "active"
+
+    # Determine which apps to remove based on input flags
+    - name: Set apps to remove based on flags
+      set_fact:
+        apps_to_remove_dict: "{{ {} }}"
+        
+    - name: Add default apps if remove_all=yes
+      set_fact:
+        apps_to_remove_dict: "{{ apps_to_remove_dict | combine({item.key: item.value}) }}"
+      with_dict: "{{ apps }}"
+      when: 
+        - remove_all | bool
+        - item.value.custom is not defined
+
+    - name: Add custom apps if remove_custom=yes
+      set_fact:
+        apps_to_remove_dict: "{{ apps_to_remove_dict | combine({item.key: item.value}) }}"
+      with_dict: "{{ apps }}"
+      when: 
+        - remove_custom | bool
+        - item.value.custom is defined
+        
+    - name: Add selected apps
+      set_fact:
+        apps_to_remove_dict: "{{ apps_to_remove_dict | combine({item.key: apps[item.key]}) }}"
+      with_dict: "{{ selected_apps }}"
+      when: 
+        - item.value | bool
+        - apps[item.key] is defined
+        
+    - name: Show apps to be removed
+      debug:
+        msg: "Will remove these applications: {{ apps_to_remove_dict.keys() | list | join(', ') if apps_to_remove_dict.keys() | list | length > 0 else 'none' }}"
+
+    - name: Debug application namespaces
+      debug:
+        msg: "App {{ item.key }} uses namespace {{ item.value.namespace }}"
+      with_dict: "{{ apps_to_remove_dict }}"
+
+    - name: Identify dangerous apps for removal
+      set_fact:
+        dangerous_apps: "{{ apps_to_remove_dict | dict2items | selectattr('value.dangerous', 'defined') | selectattr('value.dangerous') | map(attribute='key') | list }}"
+        
+    # Safety check section
+    - name: Evaluate danger status
+      block:
+        - name: Check for dangerous apps
+          set_fact:
+            has_dangerous_apps: "{{ dangerous_apps | length > 0 }}"
+          
+        - name: Handle non-dangerous removal
+          set_fact:
+            user_confirmed: true
+          when: not has_dangerous_apps
+
+        - name: Handle dangerous removal
+          block:
+            - name: Show danger warning
+              debug:
+                msg: "DANGER: Removing {{ dangerous_apps }} may cause data loss!"
+              
+            - name: Get user confirmation
+              pause:
+                prompt: "Type 'CONFIRM' to proceed with dangerous removal"
+              register: danger_confirm
+              when: not automated_removal
+
+            - name: Validate confirmation
+              set_fact:
+                user_confirmed: "{{ danger_confirm.user_input == 'CONFIRM' }}"
+              when: not automated_removal
+
+          when: has_dangerous_apps
+
+        - name: Abort if unconfirmed danger
+          fail:
+            msg: "Aborted due to unconfirmed dangerous removal"
+          when: 
+            - has_dangerous_apps
+            - not user_confirmed | default(false)
+            - not automated_removal
+
+
+    # Check which apps actually exist
+    - name: List all namespaces for reference
+      shell: |
+        k3s kubectl get ns --no-headers | awk '{print $1}'
+      register: all_namespaces
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+        
+    - name: Display all existing namespaces
+      debug:
+        msg: "Existing namespaces: {{ all_namespaces.stdout_lines }}"
+
+    - name: Check application namespace existence
+      shell: |
+        k3s kubectl get ns {{ item.value.namespace }} --no-headers 2>/dev/null && echo "exists" || echo "missing"
+      register: app_check
+      loop: "{{ apps_to_remove_dict | dict2items }}"
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+        
+    - name: Debug namespace check results
+      debug:
+        msg: "Namespace {{ item.item.value.namespace }} for app {{ item.item.key }}: {{ item.stdout }}"
+      loop: "{{ app_check.results }}"
+
+    # Create a list of existing apps that need to be removed
+    - name: Collect existing namespaces to remove
+      set_fact:
+        existing_apps: "{{ app_check.results | selectattr('stdout', 'search', 'exists') | list }}"
+        
+    - name: Debug existing apps
+      debug:
+        msg: "Found {{ existing_apps | length }} existing apps to remove: {{ existing_apps | map(attribute='item.key') | list | join(', ') }}"
+
+    - name: Show removal plan
+      debug:
+        msg: |
+          REMOVAL PLAN:
+          {% for app in existing_apps %}
+          - {{ app.item.key }} ({{ app.item.value.namespace }}){% if app.item.value.dangerous | default(false) %} [DANGEROUS]{% endif %}
+          {% endfor %}
+      when: existing_apps | length > 0
+
+    # Process removal of apps that exist
+    - name: Process application removal
+      block:
+        # Check for Helm releases before uninstallation
+        - name: Check if Helm release exists
+          shell: helm status {{ item.value.helm_release }} -n {{ item.value.namespace }}
+          register: helm_status
+          ignore_errors: yes
+          loop: "{{ existing_apps }}"
+          when: 
+            - item.item.value.helm_release is defined
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        # First try Helm uninstallation if applicable
+        - name: Uninstall via Helm
+          shell: |
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+            helm uninstall {{ item.item.value.helm_release }} \
+              -n {{ item.item.value.namespace }} \
+              --wait \
+              --timeout {{ item.item.value.removal_timeout | default(300) }}s
+          register: helm_uninstall
+          loop: "{{ existing_apps }}"
+          when: 
+            - item.item.value.helm_release is defined
+            - helm_status.results[loop.index0].rc == 0  # Only if release exists
+          ignore_errors: yes
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        # Check manifest file existence
+        - name: Check manifest file exists
+          stat:
+            path: "{{ item.item.value.manifest_file }}"
+          register: manifest_exists
+          loop: "{{ existing_apps }}"
+          when: 
+            - item.item.value.manifest_method | default(false)
+
+        # Then try manifest deletion if applicable
+        - name: Remove via manifest files
+          shell: |
+            k3s kubectl delete -f {{ item.item.value.manifest_file }} \
+              --ignore-not-found=true \
+              --grace-period=30 \
+              --timeout={{ item.item.value.removal_timeout | default(300) }}s
+          register: manifest_removal
+          loop: "{{ existing_apps }}"
+          when: 
+            - item.item.value.manifest_method | default(false)
+            - manifest_exists.results[loop.index0].stat.exists  # Only if file exists
+          ignore_errors: yes
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+
+
+        # Clean up any remaining resources
+        - name: Clean up remaining resources
+          shell: |
+            # Define resources to clean up
+            RESOURCES="{{ item.item.value.cleanup_resources | default(['all']) | join(' ') }}"
+            
+            # Attempt normal cleanup first
+            for resource in $RESOURCES; do
+              echo "Deleting all $resource in namespace {{ item.item.value.namespace }}"
+              k3s kubectl delete $resource --all \
+                -n {{ item.item.value.namespace }} \
+                --wait=true \
+                --timeout={{ item.item.value.removal_timeout | default(300) }}s || true
+            done
+            
+            # Force cleanup if needed
+            REMAINING=$(k3s kubectl get all -n {{ item.item.value.namespace }} -o name 2>/dev/null | wc -l)
+            if [ $REMAINING -gt 0 ]; then
+              echo "$REMAINING resources still remain, forcing deletion..."
+              for resource in $RESOURCES; do
+                k3s kubectl delete $resource --all \
+                  -n {{ item.item.value.namespace }} \
+                  --grace-period=0 \
+                  --force || true
+              done
+            fi
+          loop: "{{ existing_apps }}"
+          ignore_errors: yes
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        # Force namespace removal
+        - name: Force namespace cleanup and removal
+          shell: |
+            # Check if namespace still exists
+            if k3s kubectl get ns {{ item.item.value.namespace }} 2>/dev/null; then
+              echo "Forcing namespace {{ item.item.value.namespace }} removal..."
+              
+              # Patch namespace to remove finalizers
+              k3s kubectl patch ns {{ item.item.value.namespace }} \
+                -p '{"metadata":{"finalizers":[]}}' \
+                --type=merge || true
+              
+              # Force delete namespace
+              k3s kubectl delete ns {{ item.item.value.namespace }} \
+                --grace-period=0 \
+                --force || true
+            fi
+          loop: "{{ existing_apps }}"
+          ignore_errors: yes
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+      when: existing_apps | length > 0
+
+    # Verify results
+    - name: Verify namespace removal
+      shell: |
+        k3s kubectl get ns {{ item.item.value.namespace }} 2>/dev/null \
+          && echo "still-exists" || echo "removed"
+      loop: "{{ existing_apps }}"
+      register: removal_check
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+      when: existing_apps | length > 0
+
+    # Show summary
+    - name: Removal summary
+      debug:
+        msg: |
+          {{ item.item.item.key }} ({{ item.item.item.value.namespace }}): {{ "REMOVED" if item.stdout == "removed" else "FAILED" }}
+      loop: "{{ removal_check.results }}"
+      when: removal_check.results is defined and removal_check.results | length > 0
+
+    # Special Longhorn cleanup
+    - name: Check for Longhorn remnants
+      shell: |
+        k3s kubectl get pv -o json | grep 'longhorn' || echo "No longhorn volumes"
+      register: longhorn_volumes
+      ignore_errors: yes
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+      when: "'longhorn' in apps_to_remove_dict"
+
+    - name: Warn about Longhorn data
+      debug:
+        msg: |
+          NOTICE: Longhorn persistent volumes may still exist on your nodes.
+          To clean up local Longhorn data, run on each node:
+          sudo rm -rf /var/lib/longhorn
+      when: longhorn_volumes is defined and longhorn_volumes.stdout is defined and "No longhorn volumes" not in longhorn_volumes.stdout
+
+    # Final message
+    - name: Display completion message
+      debug:
+        msg: |
+          Application removal process complete.
+          
+          IMPORTANT NOTES:
+          1. If any applications were using Persistent Volumes, the data may still exist
+             on your nodes or NFS shares. You may need to manually clean those up.
+          
+          2. For a full K3s reset, use: ansible-playbook playbooks/k3s-cleanup.yml

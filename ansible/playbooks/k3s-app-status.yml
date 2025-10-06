@@ -1,0 +1,124 @@
+---
+# 3.14. K3s Application Status Check Playbook - ~/ansible/playbooks/k3s-app-status.yml
+# This playbook checks the status of applications in the K3s cluster
+
+- name: Check K3s applications status
+  hosts: master
+  become: yes
+  vars:
+    show_details: no  # Set to yes to see detailed resources
+  
+  tasks:
+    # Load app definitions
+    - name: Load default application definitions
+      include_vars:
+        file: "../vars/main.yml"
+        
+    # Optional: Load custom app definitions if they exist
+    - name: Check if custom apps file exists
+      stat:
+        path: "../vars/custom_apps.yml"
+      register: custom_apps_file
+        
+    - name: Load custom application definitions
+      include_vars:
+        file: "../vars/custom_apps.yml"
+        name: custom_apps
+      when: custom_apps_file.stat.exists
+      
+    # Merge custom apps into main apps if needed
+    - name: Add custom apps to main apps list
+      set_fact:
+        apps: "{{ apps | combine(custom_apps.apps) }}"
+      when: custom_apps_file.stat.exists and custom_apps is defined
+
+    # Verify K3s is running
+    - name: Verify K3s is running
+      command: systemctl is-active k3s
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Show K3s status
+      debug:
+        msg: "K3s status: {{ k3s_status.stdout }}"
+
+    # Check each application namespace
+    - name: Check application namespaces
+      shell: |
+        k3s kubectl get ns {{ item.value.namespace }} -o name 2>/dev/null || echo "not found"
+      register: ns_check
+      loop: "{{ apps | dict2items }}"
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+      when: k3s_status.stdout == 'active'
+
+    # Build status report
+    - name: Create application status dictionary
+      set_fact:
+        app_status: "{{ app_status | default({}) | combine({item.item.key: {
+          'namespace': item.item.value.namespace,
+          'installed': item.stdout != 'not found',
+          'description': item.item.value.description | default('No description'),
+          'custom': item.item.value.custom | default(false)
+        }}) }}"
+      loop: "{{ ns_check.results }}"
+      when: ns_check.results is defined
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    # Show status report
+    - name: Display application status report
+      debug:
+        msg: |
+          ------------------------------------------------------------
+          K3S APPLICATION STATUS REPORT
+          ------------------------------------------------------------
+          Cluster status: {{ 'Running' if k3s_status.stdout == 'active' else 'Not running' }}
+          ------------------------------------------------------------
+          
+          DEFAULT APPLICATIONS:
+          {% for app in app_status | default({}) | dict2items %}
+          {% if not app.value.custom | default(false) %}
+          {{ app.key }}: {{ 'INSTALLED' if app.value.installed else 'NOT INSTALLED' }}
+          {% endif %}
+          {% endfor %}
+          
+          {% if app_status | default({}) | dict2items | selectattr('value.custom', 'defined') | selectattr('value.custom') | list | length > 0 %}
+          CUSTOM APPLICATIONS:
+          {% for app in app_status | default({}) | dict2items %}
+          {% if app.value.custom | default(false) %}
+          {{ app.key }}: {{ 'INSTALLED' if app.value.installed else 'NOT INSTALLED' }}
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+          ------------------------------------------------------------
+      when: app_status is defined
+
+    # Show detailed information if requested
+    - name: Get detailed status for installed apps
+      shell: |
+        if k3s kubectl get ns {{ item.value.namespace }} 2>/dev/null; then
+          echo "====== RESOURCES FOR {{ item.key }} ======"
+          echo "PODS:"
+          k3s kubectl get pods -n {{ item.value.namespace }} 2>/dev/null || echo "No pods found"
+          echo "SERVICES:"
+          k3s kubectl get svc -n {{ item.value.namespace }} 2>/dev/null || echo "No services found"
+          echo "DEPLOYMENTS:"
+          k3s kubectl get deployments -n {{ item.value.namespace }} 2>/dev/null || echo "No deployments found"
+        else
+          echo "Namespace {{ item.value.namespace }} does not exist"
+        fi
+      register: detailed_status
+      loop: "{{ app_status | default({}) | dict2items | selectattr('value.installed') | list }}"
+      when: show_details | bool and k3s_status.stdout == 'active'
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+      loop_control:
+        label: "{{ item.key }}"
+        
+    - name: Display detailed status
+      debug:
+        msg: "{{ detailed_status.results | map(attribute='stdout_lines') | list }}"
+      when: detailed_status is defined and detailed_status.results is defined and show_details | bool

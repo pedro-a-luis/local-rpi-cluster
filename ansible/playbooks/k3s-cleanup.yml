@@ -1,0 +1,140 @@
+---
+# 3.7. K3s Cleanup Playbook - ~/ansible/playbooks/k3s-cleanup.yml
+# This playbook completely removes K3s and associated components from the cluster
+
+- name: Uninstall K3s from worker nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Run K3s uninstall script for agents
+      shell: /usr/local/bin/k3s-agent-uninstall.sh
+      ignore_errors: yes
+      register: agent_uninstall
+      changed_when: agent_uninstall.rc == 0
+      
+    - name: Display agent uninstall result
+      debug:
+        msg: "{{ agent_uninstall.stdout_lines }}"
+      when: agent_uninstall.stdout_lines is defined
+
+- name: Uninstall K3s from master node
+  hosts: master
+  become: yes
+  tasks:
+    - name: Run K3s uninstall script for server
+      shell: /usr/local/bin/k3s-uninstall.sh
+      ignore_errors: yes
+      register: server_uninstall
+      changed_when: server_uninstall.rc == 0
+      
+    - name: Display server uninstall result
+      debug:
+        msg: "{{ server_uninstall.stdout_lines }}"
+      when: server_uninstall.stdout_lines is defined
+
+- name: Clean up K3s artifacts on all nodes
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Remove K3s directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /etc/rancher
+        - /var/lib/rancher
+        - /var/lib/kubelet
+        - /var/lib/longhorn
+        - /var/lib/cni
+      ignore_errors: yes
+      
+    - name: Remove CNI configuration
+      file:
+        path: /etc/cni/net.d
+        state: absent
+      ignore_errors: yes
+      
+    - name: Clean up iptables
+      shell: |
+        # Reset iptables
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+      ignore_errors: yes
+      
+    - name: Clean up network interfaces
+      shell: |
+        # Remove flannel.1, cni0, and other virtual interfaces
+        ip link delete flannel.1 || true
+        ip link delete cni0 || true
+        
+        # Remove the Longhorn disk
+        rm -rf /var/lib/longhorn || true
+      ignore_errors: yes
+      
+    - name: Restart Docker
+      systemd:
+        name: docker
+        state: restarted
+      ignore_errors: yes
+      
+    - name: Remove Helm binary and configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /usr/local/bin/helm
+        - "/home/{{ ansible_user }}/.helm"
+        - "/root/.helm"
+      ignore_errors: yes
+      
+    - name: Remove kubeconfig
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/home/{{ ansible_user }}/.kube"
+        - "/root/.kube"
+        - "/etc/kubernetes"
+      ignore_errors: yes
+      
+    - name: Reboot nodes to clean up network and mounts
+      reboot:
+        reboot_timeout: 300
+        post_reboot_delay: 30
+      ignore_errors: yes
+
+- name: Verify K3s is removed
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Check for K3s processes
+      shell: ps aux | grep -v grep | grep -E 'k3s|kubelet|flannel|containerd' || echo "No K3s processes found"
+      register: processes
+      changed_when: false
+      
+    - name: Display process check results
+      debug:
+        msg: "{{ processes.stdout_lines }}"
+        
+    - name: Check for K3s directories
+      shell: ls -la /etc/rancher /var/lib/rancher 2>/dev/null || echo "K3s directories not found"
+      register: directories
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display directory check results
+      debug:
+        msg: "{{ directories.stdout_lines }}"
+        
+    - name: Check for k3s binary
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+      
+    - name: Confirm k3s binary status
+      debug:
+        msg: "K3s binary {{ 'still exists' if k3s_binary.stat.exists else 'has been removed' }}"

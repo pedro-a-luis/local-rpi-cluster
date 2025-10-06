@@ -1,0 +1,53 @@
+---
+# Ansible Vault Template - Encrypted Secrets
+#
+# SETUP INSTRUCTIONS:
+# 1. Create vault password file:
+#    echo "your-secure-vault-password" > ~/.ansible-vault-password
+#    chmod 600 ~/.ansible-vault-password
+#
+# 2. Add to ansible.cfg:
+#    vault_password_file = ~/.ansible-vault-password
+#
+# 3. Encrypt this file:
+#    ansible-vault encrypt ansible/vault.yml
+#
+# 4. Edit encrypted file:
+#    ansible-vault edit ansible/vault.yml
+#
+# 5. Update .gitignore:
+#    echo ".ansible-vault-password" >> .gitignore
+#    echo "vault.yml" >> .gitignore
+#
+# USAGE IN PLAYBOOKS:
+#   vars_files:
+#     - vault.yml
+#   tasks:
+#     - name: Use secret
+#       debug:
+#         msg: "{{ vault_synology_password }}"
+
+# Synology Credentials
+vault_synology_user: "synology-ds723"
+vault_synology_password: "CHANGE_ME_BEFORE_ENCRYPTING"
+vault_synology_host: "192.168.1.20"
+
+# Pi-hole Credentials
+vault_pihole_password: "CHANGE_ME_BEFORE_ENCRYPTING"
+vault_pihole_user: "admin"
+
+# K3s Cluster Credentials
+vault_k3s_token: "CHANGE_ME_BEFORE_ENCRYPTING"
+
+# WireGuard Credentials (if needed)
+vault_wireguard_private_key: "CHANGE_ME_BEFORE_ENCRYPTING"
+
+# Database Passwords
+vault_postgresql_password: "CHANGE_ME_BEFORE_ENCRYPTING"
+vault_grafana_admin_password: "Grafana123"  # Change this too
+
+# NFS Credentials (if needed)
+vault_nfs_password: "CHANGE_ME_BEFORE_ENCRYPTING"
+
+# Certificate Archive ID
+vault_cert_archive_id: "Yxt8vg"

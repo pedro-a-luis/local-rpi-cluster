@@ -1,0 +1,87 @@
+---
+# Ansible Playbook: Update Ingress Routes in K3s Cluster
+#
+# This playbook updates ingress routes to use the correct domain and certificates.
+#
+# Usage:
+#   ansible-playbook playbooks/update-ingress.yml
+#
+# Requirements:
+#   - kubectl configured
+
+- name: Update Ingress Routes in K3s Cluster
+  hosts: localhost
+  gather_facts: no
+  vars:
+    domain: "stratdata.org"
+    secret_name: "stratdata-wildcard-tls"
+    ingress_routes:
+      - name: "kube-prometheus-grafana"
+        namespace: "monitoring"
+        host: "grafana.{{ domain }}"
+      - name: "longhorn-ingress"
+        namespace: "longhorn-system"
+        host: "longhorn.{{ domain }}"
+      - name: "codeserver"
+        namespace: "dev-tools"
+        host: "code.{{ domain }}"
+
+  tasks:
+    - name: Get current ingress configuration
+      ansible.builtin.shell: |
+        kubectl get ingress {{ item.name }} -n {{ item.namespace }} -o yaml
+      loop: "{{ ingress_routes }}"
+      register: current_ingress
+
+    - name: Update ingress host
+      ansible.builtin.shell: |
+        kubectl patch ingress {{ item.name }} -n {{ item.namespace }} --type=json \
+          -p='[{"op": "replace", "path": "/spec/rules/0/host", "value": "{{ item.host }}"}]'
+      loop: "{{ ingress_routes }}"
+      register: host_update
+
+    - name: Update TLS configuration
+      ansible.builtin.shell: |
+        kubectl patch ingress {{ item.name }} -n {{ item.namespace }} --type=json \
+          -p='[{"op": "replace", "path": "/spec/tls/0/hosts/0", "value": "{{ item.host }}"},
+              {"op": "replace", "path": "/spec/tls/0/secretName", "value": "{{ secret_name }}"}]'
+      loop: "{{ ingress_routes }}"
+      when: item.name != "codeserver"
+      register: tls_update
+      ignore_errors: yes
+
+    - name: Add TLS to codeserver if missing
+      ansible.builtin.shell: |
+        kubectl patch ingress codeserver -n dev-tools --type=json \
+          -p='[{"op": "add", "path": "/spec/tls", "value": [{"hosts": ["code.{{ domain }}"], "secretName": "{{ secret_name }}"}]}]'
+      ignore_errors: yes
+
+    - name: Remove cert-manager annotations
+      ansible.builtin.shell: |
+        kubectl annotate ingress {{ item.name }} -n {{ item.namespace }} \
+          cert-manager.io/cluster-issuer- --overwrite
+      loop: "{{ ingress_routes }}"
+      ignore_errors: yes
+
+    - name: Get updated ingress configuration
+      ansible.builtin.shell: |
+        kubectl get ingress -A
+      register: final_ingress
+
+    - name: Display updated ingress routes
+      ansible.builtin.debug:
+        msg: "{{ final_ingress.stdout_lines }}"
+
+    - name: Test ingress endpoints
+      ansible.builtin.uri:
+        url: "https://{{ item.host }}"
+        validate_certs: no
+        status_code: [200, 302, 401]
+      loop: "{{ ingress_routes }}"
+      register: endpoint_test
+      ignore_errors: yes
+
+    - name: Display endpoint test results
+      ansible.builtin.debug:
+        msg: "{{ item.item.host }}: {{ item.status | default('FAILED') }}"
+      loop: "{{ endpoint_test.results }}"

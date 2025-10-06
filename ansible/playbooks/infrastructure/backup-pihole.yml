@@ -1,0 +1,209 @@
+---
+# Backup Pi-hole Configuration - ~/ansible/playbooks/infrastructure/backup-pihole.yml
+# This playbook backs up Pi-hole, dnsmasq, and WireGuard configurations
+# Servers: rpi-vpn-1 (192.168.1.25), rpi-vpn-2 (192.168.1.26)
+
+- name: Backup Pi-hole Configurations
+  hosts: pihole
+  become: yes
+  vars:
+    backup_dir: "/home/{{ ansible_user }}/backups"
+    backup_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    local_backup_dir: "/root/gitlab/local-rpi-cluster/backups/pihole"
+
+  tasks:
+    - name: Display backup start message
+      debug:
+        msg: |
+          =================================================
+          STARTING BACKUP: {{ inventory_hostname }}
+          =================================================
+          Timestamp: {{ backup_timestamp }}
+          Remote backup dir: {{ backup_dir }}
+          Local backup dir: {{ local_backup_dir }}
+          =================================================
+
+    - name: Create backup directory on Pi-hole server
+      file:
+        path: "{{ backup_dir }}/pihole-{{ backup_timestamp }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Backup Pi-hole configuration directory
+      shell: |
+        sudo tar czf {{ backup_dir }}/pihole-{{ backup_timestamp }}/pihole-config.tar.gz \
+          /etc/pihole/ \
+          --exclude=/etc/pihole/pihole-FTL.db
+      args:
+        creates: "{{ backup_dir }}/pihole-{{ backup_timestamp }}/pihole-config.tar.gz"
+
+    - name: Backup dnsmasq configuration
+      shell: |
+        sudo tar czf {{ backup_dir }}/pihole-{{ backup_timestamp }}/dnsmasq-config.tar.gz \
+          /etc/dnsmasq.d/
+      args:
+        creates: "{{ backup_dir }}/pihole-{{ backup_timestamp }}/dnsmasq-config.tar.gz"
+
+    - name: Backup WireGuard configuration
+      shell: |
+        sudo tar czf {{ backup_dir }}/pihole-{{ backup_timestamp }}/wireguard-config.tar.gz \
+          /etc/wireguard/
+      args:
+        creates: "{{ backup_dir }}/pihole-{{ backup_timestamp }}/wireguard-config.tar.gz"
+      when: wireguard_enabled
+      ignore_errors: yes
+
+    - name: Export Pi-hole teleporter backup
+      shell: pihole -a -t {{ backup_dir }}/pihole-{{ backup_timestamp }}/pihole-teleporter-{{ backup_timestamp }}.tar.gz
+      register: teleporter_backup
+      changed_when: teleporter_backup.rc == 0
+
+    - name: Create backup manifest
+      copy:
+        content: |
+          Pi-hole Backup Manifest
+          =======================
+          Server: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          Role: {{ pihole_role }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Backup ID: {{ backup_timestamp }}
+
+          System Information:
+          - OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          - Kernel: {{ ansible_kernel }}
+          - Pi-hole Version: {{ pihole_version.stdout | default('Unknown') }}
+
+          Backup Contents:
+          - pihole-config.tar.gz: /etc/pihole/ configuration
+          - dnsmasq-config.tar.gz: /etc/dnsmasq.d/ configuration
+          {% if wireguard_enabled %}
+          - wireguard-config.tar.gz: /etc/wireguard/ configuration
+          {% endif %}
+          - pihole-teleporter-{{ backup_timestamp }}.tar.gz: Complete Pi-hole export
+
+          Restoration Instructions:
+          1. Extract archives to respective directories
+          2. Restore ownership: sudo chown -R pihole:pihole /etc/pihole
+          3. Restart services: pihole restartdns
+          {% if wireguard_enabled %}
+          4. Restart WireGuard: sudo systemctl restart wg-quick@wg0
+          {% endif %}
+        dest: "{{ backup_dir }}/pihole-{{ backup_timestamp }}/MANIFEST.txt"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    - name: Get Pi-hole version for manifest
+      shell: pihole -v | grep 'Pi-hole version' | awk '{print $4}'
+      register: pihole_version
+      changed_when: false
+
+    - name: List backup files
+      shell: ls -lh {{ backup_dir }}/pihole-{{ backup_timestamp }}/
+      register: backup_files
+      changed_when: false
+
+    - name: Display backup files
+      debug:
+        msg: "{{ backup_files.stdout_lines }}"
+
+    - name: Calculate backup size
+      shell: du -sh {{ backup_dir }}/pihole-{{ backup_timestamp }}/ | awk '{print $1}'
+      register: backup_size
+      changed_when: false
+
+    - name: Create local backup directory
+      file:
+        path: "{{ local_backup_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Download backup to local machine
+      synchronize:
+        mode: pull
+        src: "{{ backup_dir }}/pihole-{{ backup_timestamp }}/"
+        dest: "{{ local_backup_dir }}/{{ inventory_hostname }}-{{ backup_timestamp }}/"
+      register: download_backup
+
+    - name: Cleanup old backups (keep last 5)
+      shell: |
+        cd {{ backup_dir }}
+        ls -t | grep "^pihole-" | tail -n +6 | xargs -r rm -rf
+      when: cleanup_old_backups | default(true)
+
+    - name: Backup completion summary
+      debug:
+        msg: |
+          =================================================
+          BACKUP COMPLETED: {{ inventory_hostname }}
+          =================================================
+          Backup location: {{ backup_dir }}/pihole-{{ backup_timestamp }}/
+          Backup size: {{ backup_size.stdout }}
+          Local copy: {{ local_backup_dir }}/{{ inventory_hostname }}-{{ backup_timestamp }}/
+
+          Files backed up:
+          - Pi-hole configuration
+          - Dnsmasq DNS records
+          {% if wireguard_enabled %}
+          - WireGuard VPN configuration
+          {% endif %}
+          - Complete teleporter export
+
+          Old backups cleaned up: {{ 'Yes' if cleanup_old_backups | default(true) else 'No' }}
+          =================================================
+
+- name: Final backup summary
+  hosts: localhost
+  gather_facts: no
+  vars:
+    local_backup_dir: "/root/gitlab/local-rpi-cluster/backups/pihole"
+    backup_timestamp: "{{ hostvars[groups['pihole'][0]].backup_timestamp }}"
+
+  tasks:
+    - name: List all local backups
+      shell: ls -lh {{ local_backup_dir }}/
+      register: all_backups
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display all backups
+      debug:
+        msg: "{{ all_backups.stdout_lines }}"
+      when: all_backups.rc == 0
+
+    - name: Calculate total backup size
+      shell: du -sh {{ local_backup_dir }}/ | awk '{print $1}'
+      register: total_backup_size
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Final summary
+      debug:
+        msg: |
+          =================================================
+          PI-HOLE BACKUP COMPLETE
+          =================================================
+          Servers backed up:
+          - rpi-vpn-1 (192.168.1.25) - Primary DNS
+          - rpi-vpn-2 (192.168.1.26) - Secondary DNS
+
+          Local backup location:
+          {{ local_backup_dir }}/
+
+          Total backup size: {{ total_backup_size.stdout | default('Unknown') }}
+
+          RESTORATION:
+          1. Copy backup to Pi-hole server:
+             scp -r {{ local_backup_dir }}/rpi-vpn-1-* admin@192.168.1.25:~/
+          2. Extract archives as root
+          3. Restart Pi-hole: pihole restartdns
+
+          AUTOMATED RESTORATION:
+          Use restore-pihole.yml playbook (if needed, create it)
+
+          =================================================

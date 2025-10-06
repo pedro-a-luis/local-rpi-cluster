@@ -1,0 +1,314 @@
+---
+# 3.9. K3s Application Installation Playbook - ~/ansible/playbooks/k3s-install-apps.yml
+# This playbook installs applications to the K3s cluster using Helm or manifests
+# It uses the same application definitions as the removal playbook
+
+- name: Install applications to K3s cluster
+  hosts: master
+  become: yes
+  vars:
+    install_all: no
+    app_config: "../vars/main.yml"  # Default config file location relative to playbook
+
+  tasks:
+    # Load application definitions from vars file
+    - name: Load application configuration
+      include_vars: "{{ app_config }}"
+      
+    - name: Debug loaded configuration
+      debug:
+        msg: "Loaded app configuration from: {{ app_config }}"
+        verbosity: 1
+
+    - name: Verify K3s is running
+      command: systemctl is-active k3s
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if K3s not running
+      fail:
+        msg: "K3s must be active to install applications"
+      when: k3s_status.stdout != "active"
+
+    # Create a list of apps to install based on input
+    - name: Create list of apps to install
+      set_fact:
+        apps_to_install: "{{ apps | dict2items | selectattr('value.install', 'defined') | selectattr('value.install') | list if not install_all else apps | dict2items }}"
+
+    - name: Display apps to be installed
+      debug:
+        msg: "Will install: {{ apps_to_install | map(attribute='key') | join(', ') if apps_to_install | length > 0 else 'none' }}"
+
+    - name: Check helm is installed
+      command: which helm
+      register: helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install helm if not present
+      shell: |
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod +x get_helm.sh
+        ./get_helm.sh
+        rm get_helm.sh
+      when: helm_check.rc != 0
+
+    - name: Process application installation
+      block:
+        - name: Create application namespaces
+          shell: |
+            k3s kubectl create namespace {{ item.value.namespace }} --dry-run=client -o yaml | k3s kubectl apply -f -
+          loop: "{{ apps_to_install }}"
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Add Helm repositories
+          block:
+            # Define Helm repositories for standard applications
+            - name: Add Prometheus Helm repository
+              shell: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+              when: "'monitoring' in apps_to_install | map(attribute='key') | list"
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Add Nginx Ingress Helm repository
+              shell: helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+              when: "'ingress' in apps_to_install | map(attribute='key') | list"
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Add Longhorn Helm repository
+              shell: helm repo add longhorn https://charts.longhorn.io
+              when: "'longhorn' in apps_to_install | map(attribute='key') | list"
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Add Kubernetes Dashboard Helm repository
+              shell: helm repo add kubernetes-dashboard https://kubernetes.github.io/dashboard/
+              when: "'dashboard' in apps_to_install | map(attribute='key') | list"
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Add Cert Manager Helm repository
+              shell: helm repo add jetstack https://charts.jetstack.io
+              when: "'cert-manager' in apps_to_install | map(attribute='key') | list"
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+            
+            # Update helm repos
+            - name: Update Helm repositories
+              shell: helm repo update
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Install apps using Helm
+          block:
+            - name: Install Prometheus Stack
+              shell: |
+                helm upgrade --install prometheus-stack prometheus-community/kube-prometheus-stack \
+                  --namespace {{ apps.monitoring.namespace }} \
+                  --version 56.7.0 \
+                  --set grafana.persistence.enabled=true \
+                  --set grafana.persistence.size=2Gi \
+                  --set prometheus.prometheusSpec.retention=7d \
+                  --set prometheus.prometheusSpec.resources.requests.memory=256Mi \
+                  --set prometheus.prometheusSpec.resources.limits.memory=1Gi \
+                  --timeout 10m
+              when: 
+                - "'monitoring' in apps_to_install | map(attribute='key') | list"
+                - not apps.monitoring.manifest_method | default(false)
+              register: monitoring_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Install Nginx Ingress
+              shell: |
+                helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+                  --namespace {{ apps.ingress.namespace }} \
+                  --set controller.service.type=NodePort \
+                  --set controller.hostNetwork=true \
+                  --set controller.kind=DaemonSet \
+                  --timeout 5m
+              when: 
+                - "'ingress' in apps_to_install | map(attribute='key') | list"
+                - not apps.ingress.manifest_method | default(false)
+              register: ingress_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Install Longhorn
+              shell: |
+                helm upgrade --install longhorn longhorn/longhorn \
+                  --namespace {{ apps.longhorn.namespace }} \
+                  --set defaultSettings.defaultReplicaCount=2 \
+                  --set persistence.defaultNodeSelector.pi=enabled \
+                  --timeout 15m
+              when: 
+                - "'longhorn' in apps_to_install | map(attribute='key') | list"
+                - not apps.longhorn.manifest_method | default(false)
+              register: longhorn_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Install Kubernetes Dashboard
+              shell: |
+                helm upgrade --install kubernetes-dashboard kubernetes-dashboard/kubernetes-dashboard \
+                  --namespace {{ apps.dashboard.namespace }} \
+                  --set settings.clusterName="Pi-Cluster" \
+                  --set extraArgs="{--token-ttl=86400}" \
+                  --timeout 5m
+              when: "'dashboard' in apps_to_install | map(attribute='key') | list"
+              register: dashboard_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+              
+            - name: Install Cert Manager
+              shell: |
+                helm upgrade --install cert-manager jetstack/cert-manager \
+                  --namespace {{ apps.["cert-manager"].namespace }} \
+                  --set installCRDs=true \
+                  --timeout 5m
+              when: "'cert-manager' in apps_to_install | map(attribute='key') | list"
+              register: certmanager_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+            # Handle custom applications
+            - name: Install custom applications from Helm
+              shell: |
+                helm upgrade --install {{ item.value.helm_release }} {{ item.value.helm_chart }} \
+                  --namespace {{ item.value.namespace }} \
+                  {{ item.value.helm_options | default('') }} \
+                  --timeout {{ item.value.install_timeout | default('5m') }}
+              loop: "{{ apps_to_install }}"
+              when: 
+                - item.value.custom | default(false)
+                - not item.value.manifest_method | default(false)
+                - item.value.helm_chart is defined
+                - item.value.helm_release is defined and item.value.helm_release != ""
+              register: custom_helm_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Install apps using manifest files
+          block:
+            - name: Apply manifest files
+              shell: |
+                k3s kubectl apply -f {{ item.value.manifest_file }}
+              loop: "{{ apps_to_install }}"
+              when: 
+                - item.value.manifest_method | default(false) 
+                - item.value.manifest_file is defined
+              register: manifest_install
+              environment:
+                KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+        - name: Wait for deployments
+          shell: |
+            for i in $(seq 1 12); do
+              if k3s kubectl get deployments -n {{ item.value.namespace }} -o name | grep -q .; then
+                all_ready=true
+                for deploy in $(k3s kubectl get deployments -n {{ item.value.namespace }} -o name); do
+                  ready=$(k3s kubectl get $deploy -n {{ item.value.namespace }} -o jsonpath='{.status.readyReplicas}')
+                  desired=$(k3s kubectl get $deploy -n {{ item.value.namespace }} -o jsonpath='{.status.replicas}')
+                  if [ "$ready" != "$desired" ]; then
+                    all_ready=false
+                    break
+                  fi
+                done
+                
+                if $all_ready; then
+                  echo "All deployments ready in namespace {{ item.value.namespace }}"
+                  exit 0
+                fi
+              fi
+              
+              echo "Waiting for deployments in namespace {{ item.value.namespace }}..."
+              sleep 10
+            done
+            
+            echo "Timeout waiting for deployments in namespace {{ item.value.namespace }}"
+            exit 1
+          loop: "{{ apps_to_install }}"
+          register: deployment_wait
+          ignore_errors: yes
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+
+    - name: Verify installation
+      shell: |
+        k3s kubectl get pods --all-namespaces
+      register: pod_status
+      changed_when: false
+      environment:
+        KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+        
+    - name: Show pod status
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
+        
+    - name: Display dashboard access token (if installed)
+      block:
+        - name: Create dashboard admin service account
+          copy:
+            dest: /tmp/dashboard-admin.yaml
+            content: |
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: admin-user
+                namespace: kubernetes-dashboard
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRoleBinding
+              metadata:
+                name: admin-user
+              roleRef:
+                apiGroup: rbac.authorization.k8s.io
+                kind: ClusterRole
+                name: cluster-admin
+              subjects:
+              - kind: ServiceAccount
+                name: admin-user
+                namespace: kubernetes-dashboard
+          when: "'dashboard' in apps_to_install | map(attribute='key') | list"
+          
+        - name: Apply dashboard admin configuration
+          shell: |
+            k3s kubectl apply -f /tmp/dashboard-admin.yaml
+          when: "'dashboard' in apps_to_install | map(attribute='key') | list"
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+            
+        - name: Get dashboard access token
+          shell: |
+            k3s kubectl -n kubernetes-dashboard create token admin-user --duration=8760h
+          register: dashboard_token
+          when: "'dashboard' in apps_to_install | map(attribute='key') | list"
+          environment:
+            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
+            
+        - name: Display dashboard access token
+          debug:
+            msg: |
+              Kubernetes Dashboard Access Token (valid for 1 year):
+              {{ dashboard_token.stdout }}
+              
+              Access the dashboard at: https://192.168.1.240:30443/
+              (You may need to use kubectl port-forward for secure access)
+          when: "'dashboard' in apps_to_install | map(attribute='key') | list"
+
+    - name: Display installation completion message
+      debug:
+        msg: |
+          Application installation process complete.
+          
+          IMPORTANT NOTES:
+          1. Some applications may still be initializing. Check their status with:
+             kubectl get pods --all-namespaces
+          
+          2. For storage-related applications like Longhorn, additional configuration
+             may be required before they're fully operational.
+          
+          3. See application-specific documentation for post-installation steps.

@@ -1,0 +1,101 @@
+---
+# Simple Rsync-based Pi-hole Synchronization
+# Syncs Pi-hole configuration from primary to secondary every 15 minutes
+# Primary: rpi-vpn-1 (192.168.1.25), Secondary: rpi-vpn-2 (192.168.1.26)
+
+- name: Setup Rsync-based Pi-hole Sync
+  hosts: pihole
+  become: yes
+  vars:
+    primary_host: "192.168.1.25"
+    secondary_host: "192.168.1.26"
+
+  tasks:
+    - name: Create sync script on secondary
+      copy:
+        content: |
+          #!/bin/bash
+          # Pi-hole Sync Script
+          # Syncs configuration from primary to secondary
+
+          PRIMARY="{{ hostvars['rpi-vpn-1'].ansible_host }}"
+          SECONDARY="{{ hostvars['rpi-vpn-2'].ansible_host }}"
+
+          # Only run on secondary
+          if [ "$(hostname)" != "rpi-vpn-2" ]; then
+              exit 0
+          fi
+
+          # Sync gravity database
+          rsync -avz --delete admin@$PRIMARY:/etc/pihole/gravity.db /tmp/gravity.db.new
+          if [ $? -eq 0 ]; then
+              sudo mv /tmp/gravity.db.new /etc/pihole/gravity.db
+              sudo chown pihole:pihole /etc/pihole/gravity.db
+          fi
+
+          # Sync custom DNS
+          rsync -avz admin@$PRIMARY:/etc/dnsmasq.d/99-stratdata-local.conf /tmp/99-stratdata-local.conf.new
+          if [ $? -eq 0 ]; then
+              sudo mv /tmp/99-stratdata-local.conf.new /etc/dnsmasq.d/99-stratdata-local.conf
+              sudo chown root:root /etc/dnsmasq.d/99-stratdata-local.conf
+          fi
+
+          # Restart Pi-hole DNS
+          sudo pihole restartdns reload-lists
+
+          echo "Pi-hole sync completed at $(date)"
+        dest: /usr/local/bin/pihole-sync.sh
+        owner: root
+        group: root
+        mode: '0755'
+      when: inventory_hostname == 'rpi-vpn-2'
+
+    - name: Create cron job for automatic sync
+      cron:
+        name: "Pi-hole configuration sync"
+        minute: "*/15"
+        job: "/usr/local/bin/pihole-sync.sh >> /var/log/pihole-sync.log 2>&1"
+        user: root
+      when: inventory_hostname == 'rpi-vpn-2'
+
+    - name: Run initial sync
+      shell: /usr/local/bin/pihole-sync.sh
+      register: initial_sync
+      when: inventory_hostname == 'rpi-vpn-2'
+      changed_when: false
+
+    - name: Display sync result
+      debug:
+        msg: "{{ initial_sync.stdout_lines }}"
+      when:
+        - inventory_hostname == 'rpi-vpn-2'
+        - initial_sync is defined
+
+- name: Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display final summary
+      debug:
+        msg: |
+          =================================================
+          PI-HOLE SYNC SETUP COMPLETE
+          =================================================
+
+          Synchronization Method: Rsync
+          Primary: rpi-vpn-1 (192.168.1.25)
+          Secondary: rpi-vpn-2 (192.168.1.26)
+
+          What's synced:
+          - Gravity database (blocklists)
+          - Custom DNS entries (99-stratdata-local.conf)
+
+          Schedule: Every 15 minutes (via cron)
+          Log file: /var/log/pihole-sync.log on rpi-vpn-2
+
+          Management:
+          - Make changes on PRIMARY (rpi-vpn-1) only
+          - Secondary will sync automatically
+          - Manual sync: ssh admin@192.168.1.26 'sudo /usr/local/bin/pihole-sync.sh'
+
+          =================================================

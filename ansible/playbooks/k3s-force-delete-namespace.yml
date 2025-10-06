@@ -1,0 +1,167 @@
+---
+# 3.11. K3s Force Delete Stuck Namespaces - ~/ansible/playbooks/k3s-force-delete-namespace.yml
+# This playbook forcibly removes Kubernetes namespaces that are stuck in Terminating state
+
+- name: Force delete stuck Kubernetes namespaces
+  hosts: master
+  become: yes
+  vars:
+    # List namespaces to force delete
+    namespaces_to_delete:
+      - monitoring
+      - ingress-nginx
+      - longhorn-system
+    # Set to true to delete all namespaces in Terminating state
+    delete_all_stuck: false
+    
+    # Kubeconfig location
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+  tasks:
+    - name: Check which namespaces exist
+      shell: k3s kubectl get namespace
+      register: ns_list
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        
+    - name: Display current namespace status
+      debug:
+        msg: "{{ ns_list.stdout_lines }}"
+        
+    - name: Find all namespaces in Terminating state
+      shell: |
+        k3s kubectl get namespace | grep Terminating | awk '{print $1}'
+      register: terminating_ns
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      ignore_errors: yes
+      
+    - name: Show namespaces in Terminating state
+      debug:
+        msg: "Namespaces in Terminating state: {{ terminating_ns.stdout_lines | default(['None']) }}"
+        
+    - name: Set list of namespaces to process
+      set_fact:
+        ns_to_process: "{{ terminating_ns.stdout_lines if delete_all_stuck else namespaces_to_delete }}"
+        
+    - name: Check if each namespace exists
+      shell: k3s kubectl get namespace {{ item }} -o json 2>/dev/null || echo "NotFound"
+      register: ns_check
+      changed_when: false
+      with_items: "{{ ns_to_process }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        
+    - name: Force delete stuck namespaces
+      block:
+        - name: Create temp directory for namespace JSON files
+          file:
+            path: /tmp/k3s-ns-fix
+            state: directory
+            mode: '0755'
+            
+        - name: Get namespace definition and remove finalizers
+          shell: |
+            # Get namespace definition
+            k3s kubectl get namespace {{ item.item }} -o json > /tmp/k3s-ns-fix/{{ item.item }}.json
+            
+            # Check if finalizers exist
+            if grep -q "finalizers" /tmp/k3s-ns-fix/{{ item.item }}.json; then
+              # Create a modified version without finalizers
+              cat /tmp/k3s-ns-fix/{{ item.item }}.json | jq '.spec.finalizers = []' > /tmp/k3s-ns-fix/{{ item.item }}-nofinalizers.json
+              echo "Removed finalizers"
+            else
+              echo "No finalizers found"
+              exit 0
+            fi
+          register: remove_finalizers
+          when: item.stdout != "NotFound" and "Terminating" in ns_list.stdout
+          with_items: "{{ ns_check.results }}"
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          ignore_errors: yes
+          
+        - name: Update namespace to remove finalizers using kubectl proxy
+          shell: |
+            # Start kubectl proxy in the background
+            k3s kubectl proxy --port=8001 &
+            PROXY_PID=$!
+            
+            # Wait for proxy to start
+            sleep 3
+            
+            # Update namespace to remove finalizers
+            if [ -f /tmp/k3s-ns-fix/{{ item.item.item }}-nofinalizers.json ]; then
+              curl -k -H "Content-Type: application/json" -X PUT --data-binary @/tmp/k3s-ns-fix/{{ item.item.item }}-nofinalizers.json http://127.0.0.1:8001/api/v1/namespaces/{{ item.item.item }}/finalize
+              echo "Namespace updated via API"
+            fi
+            
+            # Kill the proxy
+            kill $PROXY_PID
+          register: update_ns
+          when: item.stdout is defined and item.stdout != ""
+          with_items: "{{ remove_finalizers.results }}"
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          ignore_errors: yes
+          
+        - name: Force delete namespace
+          shell: |
+            k3s kubectl delete namespace {{ item.item }} --force --grace-period=0
+          register: force_delete
+          when: item.stdout != "NotFound" and "Terminating" in ns_list.stdout
+          with_items: "{{ ns_check.results }}"
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          ignore_errors: yes
+          
+        - name: Final cleanup of any remaining resources
+          shell: |
+            # Find all resources in namespace and force delete them
+            RESOURCES=$(k3s kubectl api-resources --verbs=list --namespaced -o name)
+            for resource in $RESOURCES; do
+              echo "Checking $resource in namespace {{ item.item }}"
+              k3s kubectl get $resource -n {{ item.item }} -o name 2>/dev/null | xargs -r -n1 k3s kubectl delete -n {{ item.item }} --force --grace-period=0 2>/dev/null
+            done
+          when: item.stdout != "NotFound" and "Terminating" in ns_list.stdout
+          with_items: "{{ ns_check.results }}"
+          environment:
+            KUBECONFIG: "{{ kubeconfig }}"
+          ignore_errors: yes
+          
+        - name: Clean up temp directory
+          file:
+            path: /tmp/k3s-ns-fix
+            state: absent
+      when: ns_to_process | length > 0
+        
+    - name: Check namespace status after deletion
+      shell: k3s kubectl get namespace
+      register: final_ns_list
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        
+    - name: Display final namespace status
+      debug:
+        msg: "{{ final_ns_list.stdout_lines }}"
+        
+    - name: Show instructions for manual API server intervention if needed
+      debug:
+        msg: |
+          If namespaces are still stuck in Terminating state, you may need to directly edit the etcd database.
+          
+          For K3s, which uses SQLite instead of etcd, you can try:
+          
+          1. Stop the K3s server:
+             sudo systemctl stop k3s
+             
+          2. Backup the database:
+             sudo cp /var/lib/rancher/k3s/server/db/state.db /var/lib/rancher/k3s/server/db/state.db.bak
+             
+          3. Use a specialized tool or restart the entire cluster if all else fails.
+          
+          4. Restart K3s:
+             sudo systemctl start k3s
+      when: "' Terminating ' in final_ns_list.stdout"

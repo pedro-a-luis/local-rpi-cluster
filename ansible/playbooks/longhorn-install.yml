@@ -1,0 +1,180 @@
+---
+# 3.2. Longhorn Storage Installation - ~/ansible/playbooks/longhorn-install.yml
+# This playbook installs Longhorn distributed storage on the K3s cluster
+
+- name: Install Longhorn prerequisites
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Install required packages for Longhorn
+      apt:
+        name:
+          - open-iscsi
+          - nfs-common
+          - util-linux
+          - curl
+          - grep
+          - xfsprogs
+        state: present
+        update_cache: yes
+        
+    - name: Verify findmnt is available
+      shell: which findmnt || echo "not found"
+      register: findmnt_check
+      changed_when: false
+      
+    - name: Display findmnt status
+      debug:
+        msg: "findmnt command availability: {{ findmnt_check.stdout }}"
+        
+    - name: Enable and start iscsid service
+      systemd:
+        name: iscsid
+        enabled: yes
+        state: started
+
+- name: Deploy Longhorn on the master node
+  hosts: master
+  become: yes
+  vars:
+    longhorn_version: "1.5.3"  # Recent stable version
+  tasks:
+    - name: Install Helm
+      shell: |
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod 700 get_helm.sh
+        ./get_helm.sh
+        rm get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+        
+    - name: Add Longhorn Helm repository
+      shell: helm repo add longhorn https://charts.longhorn.io
+      args:
+        executable: /bin/bash
+      register: helm_repo_add
+      changed_when: "'has been added to your repositories' in helm_repo_add.stderr"
+      
+    - name: Update Helm repositories
+      shell: helm repo update
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Create Longhorn namespace
+      shell: k3s kubectl create namespace longhorn-system --dry-run=client -o yaml | k3s kubectl apply -f -
+      args:
+        executable: /bin/bash
+      changed_when: false
+      
+    - name: Check if Longhorn is already installed
+      shell: k3s kubectl get deployment -n longhorn-system longhorn-driver-deployer 2>/dev/null || echo "NotFound"
+      register: longhorn_check
+      changed_when: false
+
+    - name: Configure Longhorn default storage directory
+      copy:
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: longhorn-storageclass
+            namespace: longhorn-system
+          data:
+            storageclass.yaml: |
+              kind: StorageClass
+              apiVersion: storage.k8s.io/v1
+              metadata:
+                name: longhorn
+                annotations:
+                  storageclass.kubernetes.io/is-default-class: "true"
+              provisioner: driver.longhorn.io
+              allowVolumeExpansion: true
+              parameters:
+                numberOfReplicas: "1"
+                staleReplicaTimeout: "2880"
+                fsType: "ext4"
+        dest: /tmp/longhorn-storageclass.yaml
+      when: "'NotFound' in longhorn_check.stdout"
+      
+    - name: Create Longhorn storage class ConfigMap
+      shell: k3s kubectl apply -f /tmp/longhorn-storageclass.yaml
+      args:
+        executable: /bin/bash
+      when: "'NotFound' in longhorn_check.stdout"
+      register: storage_class_result
+      changed_when: storage_class_result.rc == 0
+      ignore_errors: yes
+
+    - name: Create Longhorn values file with additional settings
+      copy:
+        content: |
+          defaultSettings:
+            defaultReplicaCount: 1
+            createDefaultDiskLabeledNodes: true
+            systemManagedComponentsNodeSelector: false
+            guaranteedEngineManagerCPU: 0.05
+            guaranteedReplicaManagerCPU: 0.05
+            guaranteedEngineImageCPU: 0.05
+            concurrentReplicaRebuildPerNodeLimit: 1
+            concurrentVolumeBackupRestorePerNodeLimit: 1
+          persistence:
+            defaultClassReplicaCount: 1
+          resources:
+            requests:
+              cpu: 0.1
+              memory: 100Mi
+            limits:
+              cpu: 0.5
+              memory: 500Mi
+        dest: /tmp/longhorn-values.yaml
+      when: "'NotFound' in longhorn_check.stdout"
+      
+    - name: Install Longhorn using Helm
+      shell: >
+        helm install longhorn longhorn/longhorn 
+        --namespace longhorn-system 
+        --version {{ longhorn_version }} 
+        -f /tmp/longhorn-values.yaml
+      args:
+        executable: /bin/bash
+      when: "'NotFound' in longhorn_check.stdout"
+      register: helm_install
+      changed_when: helm_install.rc == 0
+      
+    - name: Wait for Longhorn deployment to be ready
+      shell: >
+        k3s kubectl rollout status deployment/longhorn-driver-deployer 
+        -n longhorn-system --timeout=600s
+      args:
+        executable: /bin/bash
+      when: "'NotFound' in longhorn_check.stdout"
+      changed_when: false
+      
+    - name: Check for Longhorn default StorageClass
+      shell: k3s kubectl get storageclass | grep longhorn | grep default
+      register: sc_check
+      ignore_errors: yes
+      changed_when: false
+      
+    - name: Make Longhorn the default StorageClass if not already
+      shell: |
+        # First remove default from any existing storage classes
+        for sc in $(k3s kubectl get storageclass -o name); do
+          k3s kubectl patch $sc -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
+        done
+        # Then set Longhorn as default
+        k3s kubectl patch storageclass longhorn -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      args:
+        executable: /bin/bash
+      when: sc_check.rc != 0
+      changed_when: true
+
+    - name: Verify Longhorn is running
+      shell: k3s kubectl get pods -n longhorn-system
+      register: longhorn_pods
+      changed_when: false
+      
+    - name: Display Longhorn pod status
+      debug:
+        msg: "{{ longhorn_pods.stdout_lines }}"

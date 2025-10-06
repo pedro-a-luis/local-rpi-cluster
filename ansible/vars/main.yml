@@ -1,0 +1,110 @@
+---
+# ~/ansible/vars/main.yml - Application definitions for K3s cluster (installation and removal)
+
+apps:
+  # Monitoring stack (Prometheus/Grafana)
+  monitoring:
+    namespace: "monitoring"
+    helm_release: "prometheus-stack"  # If using Helm-based installation
+    helm_chart: "prometheus-community/kube-prometheus-stack"
+    helm_options: "--set grafana.persistence.enabled=true --set grafana.persistence.size=2Gi --set prometheus.prometheusSpec.retention=7d"
+    install_timeout: "600s"
+    manifest_method: false             # If using manifest-based installation
+    manifest_file: "/tmp/k3s-monitoring"
+    cleanup_resources:
+      - "deployments"
+      - "statefulsets"
+      - "configmaps"
+      - "services"
+      - "secrets"
+      - "ingress"
+      - "persistentvolumeclaims"
+    removal_timeout: 300  # Seconds
+    dangerous: false
+    description: "Prometheus and Grafana monitoring stack"
+    install: true  # Set to true when you want to install this app
+
+  # Nginx Ingress Controller
+  ingress:
+    namespace: "ingress-nginx"
+    helm_release: "ingress-nginx"     # If using Helm-based installation
+    helm_chart: "ingress-nginx/ingress-nginx" 
+    helm_options: "--set controller.service.type=NodePort --set controller.hostNetwork=true --set controller.kind=DaemonSet"
+    install_timeout: "300s"
+    manifest_method: false             # If using manifest-based installation
+    manifest_file: "/tmp/nginx-ingress.yaml"
+    cleanup_resources:
+      - "deployments"
+      - "daemonsets"
+      - "configmaps"
+      - "services"
+      - "validatingwebhookconfigurations"
+    removal_timeout: 180
+    dangerous: false
+    description: "Nginx Ingress Controller"
+    install: false  # Set to true when you want to install this app
+
+  # Longhorn Distributed Storage
+  longhorn:
+    namespace: "longhorn-system"
+    helm_release: "longhorn"          # If using Helm-based installation
+    helm_chart: "longhorn/longhorn"
+    helm_options: "--set defaultSettings.defaultReplicaCount=2 --set persistence.defaultNodeSelector.pi=enabled"
+    install_timeout: "900s"
+    manifest_method: false             # If using manifest-based installation
+    manifest_file: "/tmp/longhorn.yaml"
+    cleanup_resources:
+      - "deployments"
+      - "daemonsets"
+      - "statefulsets"
+      - "services"
+      - "persistentvolumeclaims"
+      - "configmaps"
+      - "secrets"
+      - "customresourcedefinitions"
+      - "clusterroles"
+      - "clusterrolebindings"
+    removal_timeout: 600
+    dangerous: true     # Mark as dangerous due to data loss potential
+    description: "Longhorn distributed storage system (CAUTION: Removing will delete persistent volumes)"
+    install: false  # Set to true when you want to install this app
+
+  # Kubernetes Dashboard (if installed)
+  dashboard:
+    namespace: "kubernetes-dashboard"
+    helm_release: "kubernetes-dashboard"
+    helm_chart: "kubernetes-dashboard/kubernetes-dashboard"
+    helm_options: "--set settings.clusterName=\"Pi-Cluster\" --set extraArgs=\"{--token-ttl=86400}\""
+    install_timeout: "300s"
+    manifest_method: false
+    cleanup_resources:
+      - "deployments"
+      - "services"
+      - "secrets"
+      - "configmaps"
+      - "serviceaccounts"
+    removal_timeout: 120
+    dangerous: false
+    description: "Kubernetes Dashboard"
+    install: false  # Set to true when you want to install this app
+
+  # Cert-Manager (if installed)
+  cert-manager:
+    namespace: "cert-manager"
+    helm_release: "cert-manager"
+    helm_chart: "jetstack/cert-manager"
+    helm_options: "--set installCRDs=true"
+    install_timeout: "300s"
+    manifest_method: false
+    cleanup_resources:
+      - "deployments"
+      - "certificates"
+      - "issuers"
+      - "clusterissuers"
+      - "certificaterequests"
+      - "orders"
+      - "challenges"
+    removal_timeout: 180
+    dangerous: false
+    description: "Certificate management for Kubernetes"
+    install: false  # Set to true when you want to install this app

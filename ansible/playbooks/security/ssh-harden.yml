@@ -1,0 +1,216 @@
+---
+# Ansible Playbook: SSH Hardening
+#
+# This playbook hardens SSH configuration across all infrastructure.
+#
+# Usage:
+#   ansible-playbook playbooks/security/ssh-harden.yml
+#
+# CAUTION: This disables password authentication. Ensure SSH keys are configured!
+
+- name: SSH Hardening - All Hosts
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    ssh_port: 22
+    allowed_users: ["admin", "root"]
+    max_auth_tries: 3
+    client_alive_interval: 300
+    client_alive_count_max: 2
+
+  tasks:
+    - name: Ensure .ssh directory exists for admin user
+      file:
+        path: /home/admin/.ssh
+        state: directory
+        owner: admin
+        group: admin
+        mode: '0700'
+      when: "'admin' in allowed_users"
+
+    - name: Check if authorized_keys exists
+      stat:
+        path: /home/admin/.ssh/authorized_keys
+      register: auth_keys_stat
+
+    - name: Display authorized_keys status
+      debug:
+        msg: "authorized_keys exists: {{ auth_keys_stat.stat.exists }}, has {{ (lookup('file', '/home/admin/.ssh/authorized_keys', errors='ignore') | default('') | split('\n') | select | list | length) if auth_keys_stat.stat.exists else 0 }} keys"
+      when: auth_keys_stat.stat.exists
+
+    - name: Backup current SSH config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.backup.{{ ansible_date_time.epoch }}
+        remote_src: yes
+        mode: '0600'
+
+    - name: Configure SSH daemon - Security settings
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?ChallengeResponseAuthentication', line: 'ChallengeResponseAuthentication no' }
+        - { regexp: '^#?UsePAM', line: 'UsePAM yes' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries {{ max_auth_tries }}' }
+        - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval {{ client_alive_interval }}' }
+        - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax {{ client_alive_count_max }}' }
+        - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+        - { regexp: '^#?Protocol', line: 'Protocol 2' }
+        - { regexp: '^#?LogLevel', line: 'LogLevel VERBOSE' }
+        - { regexp: '^#?MaxSessions', line: 'MaxSessions 10' }
+        - { regexp: '^#?IgnoreRhosts', line: 'IgnoreRhosts yes' }
+        - { regexp: '^#?HostbasedAuthentication', line: 'HostbasedAuthentication no' }
+      notify: Restart SSH
+
+    - name: Configure allowed ciphers (strong only)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Ciphers'
+        line: 'Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Restart SSH
+
+    - name: Configure MACs (strong only)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?MACs'
+        line: 'MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Restart SSH
+
+    - name: Configure KexAlgorithms (strong only)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?KexAlgorithms'
+        line: 'KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256'
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Restart SSH
+
+    - name: Install fail2ban for SSH protection
+      apt:
+        name: fail2ban
+        state: present
+        update_cache: yes
+
+    - name: Configure fail2ban for SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 3
+
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = %(sshd_log)s
+          backend = %(sshd_backend)s
+        mode: '0644'
+      notify: Restart fail2ban
+
+    - name: Enable and start fail2ban
+      systemd:
+        name: fail2ban
+        enabled: yes
+        state: started
+
+    - name: Set SSH banner
+      copy:
+        dest: /etc/ssh/banner
+        content: |
+          **************************************************************************
+          AUTHORIZED ACCESS ONLY
+
+          This system is for authorized use only. All activity is monitored and
+          logged. Unauthorized access is strictly prohibited and will be prosecuted.
+          **************************************************************************
+        mode: '0644'
+
+    - name: Configure SSH to use banner
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Banner'
+        line: 'Banner /etc/ssh/banner'
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Restart SSH
+
+  handlers:
+    - name: Restart SSH
+      systemd:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+
+- name: Audit SSH Keys on Master
+  hosts: pi-master
+  become: yes
+  tasks:
+    - name: Display authorized_keys for review
+      command: cat /home/admin/.ssh/authorized_keys
+      register: auth_keys
+      changed_when: false
+
+    - name: Show all SSH keys (for manual review)
+      debug:
+        msg: "{{ auth_keys.stdout_lines }}"
+
+    - name: Prompt for key cleanup
+      debug:
+        msg: |
+          MANUAL ACTION REQUIRED:
+          Review the SSH keys above and remove any unknown/unused keys.
+          Edit: /home/admin/.ssh/authorized_keys
+
+          Current key count: {{ auth_keys.stdout_lines | length }}
+
+          Each key should have a comment identifying the owner.
+          Remove keys for users who no longer need access.
+
+- name: Verify SSH Configuration
+  hosts: all
+  become: yes
+  tasks:
+    - name: Test SSH configuration
+      command: sshd -t
+      register: sshd_test
+      changed_when: false
+      failed_when: sshd_test.rc != 0
+
+    - name: Display SSH test results
+      debug:
+        msg: "SSH configuration is valid"
+      when: sshd_test.rc == 0
+
+    - name: Display current SSH status
+      command: systemctl status ssh
+      register: ssh_status
+      changed_when: false
+
+    - name: Show fail2ban status
+      command: fail2ban-client status sshd
+      register: fail2ban_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display fail2ban stats
+      debug:
+        var: fail2ban_status.stdout_lines
+      when: fail2ban_status.rc == 0

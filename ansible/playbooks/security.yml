@@ -1,0 +1,20 @@
+---
+- name: Harden system security
+  hosts: all
+  become: yes
+  tasks:
+    - name: Configure SSH daemon
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^{{ item.key }}"
+        line: "{{ item.key }} {{ item.value }}"
+      loop:
+        - { key: "PermitRootLogin", value: "no" }
+        - { key: "PasswordAuthentication", value: "yes" }
+      notify: restart ssh
+
+  handlers:
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted

@@ -1,0 +1,38 @@
+# Ansible Vault
+.ansible-vault-password
+ansible/vault.yml
+
+# Ansible
+*.retry
+.ansible/
+
+# Logs
+*.log
+/tmp/
+
+# Secrets and credentials
+*secret*
+*password*
+*key*.pem
+*.key
+!*.pub
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+/tmp/
+*.tmp
