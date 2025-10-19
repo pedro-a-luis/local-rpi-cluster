@@ -1,0 +1,248 @@
+---
+# Celery Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: celery
+  labels:
+    name: celery
+---
+# Celery Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: celery
+  labels:
+    app: celery
+    component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: celery
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: celery
+        component: worker
+    spec:
+      containers:
+      - name: celery-worker
+        image: python:3.11-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install celery[redis]==5.3.4
+          celery -A tasks worker --loglevel=info --concurrency=2
+        env:
+        - name: CELERY_BROKER_URL
+          value: "redis://redis.redis.svc.cluster.local:6379/0"
+        - name: CELERY_RESULT_BACKEND
+          value: "redis://redis.redis.svc.cluster.local:6379/0"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: celery-app
+          mountPath: /app
+        workingDir: /app
+      volumes:
+      - name: celery-app
+        configMap:
+          name: celery-app
+          defaultMode: 0755
+---
+# Celery Beat (Scheduler) Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-beat
+  namespace: celery
+  labels:
+    app: celery
+    component: beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: celery
+      component: beat
+  template:
+    metadata:
+      labels:
+        app: celery
+        component: beat
+    spec:
+      containers:
+      - name: celery-beat
+        image: python:3.11-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install celery[redis]==5.3.4
+          celery -A tasks beat --loglevel=info -s /app/data/celerybeat-schedule
+        env:
+        - name: CELERY_BROKER_URL
+          value: "redis://redis.redis.svc.cluster.local:6379/0"
+        - name: CELERY_RESULT_BACKEND
+          value: "redis://redis.redis.svc.cluster.local:6379/0"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: celery-app
+          mountPath: /app
+        - name: beat-data
+          mountPath: /app/data
+        workingDir: /app
+      volumes:
+      - name: celery-app
+        configMap:
+          name: celery-app
+          defaultMode: 0755
+      - name: beat-data
+        emptyDir: {}
+---
+# Celery Flower (Monitoring) Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-flower
+  namespace: celery
+  labels:
+    app: celery
+    component: flower
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: celery
+      component: flower
+  template:
+    metadata:
+      labels:
+        app: celery
+        component: flower
+    spec:
+      containers:
+      - name: celery-flower
+        image: mher/flower:2.0
+        command:
+        - celery
+        - --broker=redis://redis.redis.svc.cluster.local:6379/0
+        - flower
+        - --port=5555
+        - --basic-auth=admin:flower123
+        ports:
+        - containerPort: 5555
+          name: http
+        env:
+        - name: CELERY_BROKER_URL
+          value: "redis://redis.redis.svc.cluster.local:6379/0"
+        - name: CELERY_RESULT_BACKEND
+          value: "redis://redis.redis.svc.cluster.local:6379/0"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5555
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+---
+# Celery Flower Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: celery-flower
+  namespace: celery
+  labels:
+    app: celery
+    component: flower
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5555
+    targetPort: 5555
+    protocol: TCP
+    name: http
+  selector:
+    app: celery
+    component: flower
+---
+# Celery App ConfigMap (Example Tasks)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: celery-app
+  namespace: celery
+data:
+  tasks.py: |
+    from celery import Celery
+    from celery.schedules import crontab
+    import time
+
+    # Initialize Celery
+    app = Celery('tasks')
+
+    # Configure Celery
+    app.conf.update(
+        broker_url='redis://redis.redis.svc.cluster.local:6379/0',
+        result_backend='redis://redis.redis.svc.cluster.local:6379/0',
+        task_serializer='json',
+        accept_content=['json'],
+        result_serializer='json',
+        timezone='UTC',
+        enable_utc=True,
+        task_track_started=True,
+        task_time_limit=30 * 60,  # 30 minutes
+        worker_prefetch_multiplier=1,
+        worker_max_tasks_per_child=1000,
+    )
+
+    # Periodic task schedule
+    app.conf.beat_schedule = {
+        'hello-every-minute': {
+            'task': 'tasks.hello',
+            'schedule': crontab(minute='*/1'),  # Every minute
+        },
+    }
+
+    @app.task(name='tasks.add')
+    def add(x, y):
+        """Example task: Add two numbers"""
+        return x + y
+
+    @app.task(name='tasks.multiply')
+    def multiply(x, y):
+        """Example task: Multiply two numbers"""
+        return x * y
+
+    @app.task(name='tasks.hello')
+    def hello():
+        """Example periodic task"""
+        return f'Hello from Celery at {time.strftime("%Y-%m-%d %H:%M:%S")}'
+
+    @app.task(name='tasks.long_running')
+    def long_running(duration=10):
+        """Example long-running task"""
+        time.sleep(duration)
+        return f'Completed after {duration} seconds'

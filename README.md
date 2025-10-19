@@ -10,6 +10,7 @@ Infrastructure automation and documentation for an 8-node Raspberry Pi 5 Kuberne
 - Longhorn: https://longhorn.stratdata.org
 - Code Server: https://code.stratdata.org
 - Airflow: https://airflow.stratdata.org (admin/admin123)
+- Flower (Celery): https://flower.stratdata.org (admin/flower123)
 
 **SSH Access**:
 ```bash
@@ -42,6 +43,8 @@ ssh -i ~/.ssh/pi_cluster admin@192.168.1.240
 - **Velero**: Kubernetes backup and disaster recovery
 - **MinIO**: S3-compatible object storage (500GB)
 - **PostgreSQL 16**: ARM64-compatible database
+- **Redis**: Message broker and caching layer
+- **Celery**: Distributed task queue with Flower monitoring
 
 ### Security
 - Let's Encrypt wildcard certificate (`*.stratdata.org`)
@@ -59,6 +62,8 @@ ssh -i ~/.ssh/pi_cluster admin@192.168.1.240
 ### Deployment Guides
 - **[Airflow Deployment](docs/deployment/airflow.md)** - Apache Airflow deployment and management
 - **[PostgreSQL Deployment](docs/deployment/postgresql.md)** - PostgreSQL ARM64 deployment guide
+- **[Celery & Redis Deployment](docs/deployment/celery.md)** - Distributed task queue deployment
+- **[Celery Quick Start](CELERY-REDIS-QUICKSTART.md)** - Quick deployment guide for Celery and Redis
 
 ### Operations
 - **[Ansible Guide](docs/operations/ansible-guide.md)** - Complete Ansible automation guide

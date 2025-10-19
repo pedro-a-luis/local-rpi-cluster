@@ -1,0 +1,414 @@
+---
+# Ansible Playbook: Install Celery in K3s Cluster
+#
+# This playbook installs Celery with Redis broker for distributed task processing.
+#
+# Usage:
+#   ansible-playbook ansible/playbooks/celery-install.yml
+#
+# Requirements:
+#   - kubectl configured
+#   - Redis already installed (run redis-install.yml first)
+
+- name: Install Celery in K3s Cluster
+  hosts: localhost
+  gather_facts: no
+  vars:
+    celery_namespace: "celery"
+    celery_domain: "flower.stratdata.org"
+    celery_secret_name: "stratdata-wildcard-tls"
+    redis_url: "redis://redis.redis.svc.cluster.local:6379/0"
+    celery_workers: 2
+    celery_concurrency: 2
+
+  tasks:
+    - name: Create Celery namespace
+      ansible.builtin.command:
+        cmd: kubectl create namespace {{ celery_namespace }}
+      register: namespace_create
+      changed_when: namespace_create.rc == 0
+      failed_when: namespace_create.rc != 0 and 'already exists' not in namespace_create.stderr
+
+    - name: Copy TLS certificate to Celery namespace
+      ansible.builtin.shell: |
+        kubectl get secret {{ celery_secret_name }} -n monitoring -o yaml | \
+        sed 's/namespace: monitoring/namespace: {{ celery_namespace }}/' | \
+        kubectl apply -f -
+      register: tls_copy
+      ignore_errors: yes
+
+    - name: Deploy Celery components
+      ansible.builtin.shell: |
+        cat <<EOF | kubectl apply -f -
+        ---
+        # Celery App ConfigMap (Example Tasks)
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: celery-app
+          namespace: {{ celery_namespace }}
+        data:
+          tasks.py: |
+            from celery import Celery
+            from celery.schedules import crontab
+            import time
+            import os
+
+            # Initialize Celery
+            app = Celery('tasks')
+
+            # Configure Celery from environment
+            broker_url = os.getenv('CELERY_BROKER_URL', '{{ redis_url }}')
+            result_backend = os.getenv('CELERY_RESULT_BACKEND', '{{ redis_url }}')
+
+            app.conf.update(
+                broker_url=broker_url,
+                result_backend=result_backend,
+                task_serializer='json',
+                accept_content=['json'],
+                result_serializer='json',
+                timezone='UTC',
+                enable_utc=True,
+                task_track_started=True,
+                task_time_limit=30 * 60,  # 30 minutes
+                worker_prefetch_multiplier=1,
+                worker_max_tasks_per_child=1000,
+            )
+
+            # Periodic task schedule
+            app.conf.beat_schedule = {
+                'hello-every-minute': {
+                    'task': 'tasks.hello',
+                    'schedule': crontab(minute='*/1'),
+                },
+                'cleanup-old-results': {
+                    'task': 'tasks.cleanup_old_results',
+                    'schedule': crontab(hour='*/6'),  # Every 6 hours
+                },
+            }
+
+            @app.task(name='tasks.add')
+            def add(x, y):
+                """Add two numbers"""
+                return x + y
+
+            @app.task(name='tasks.multiply')
+            def multiply(x, y):
+                """Multiply two numbers"""
+                return x * y
+
+            @app.task(name='tasks.hello')
+            def hello():
+                """Periodic health check task"""
+                return f'Celery is running at {time.strftime("%Y-%m-%d %H:%M:%S")}'
+
+            @app.task(name='tasks.long_running')
+            def long_running(duration=10):
+                """Simulate long-running task"""
+                time.sleep(duration)
+                return f'Task completed after {duration} seconds'
+
+            @app.task(name='tasks.cleanup_old_results')
+            def cleanup_old_results():
+                """Clean up old task results from Redis"""
+                return 'Cleanup completed'
+
+            if __name__ == '__main__':
+                app.start()
+        ---
+        # Celery Worker Deployment
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: celery-worker
+          namespace: {{ celery_namespace }}
+          labels:
+            app: celery
+            component: worker
+        spec:
+          replicas: {{ celery_workers }}
+          selector:
+            matchLabels:
+              app: celery
+              component: worker
+          template:
+            metadata:
+              labels:
+                app: celery
+                component: worker
+            spec:
+              containers:
+              - name: celery-worker
+                image: python:3.11-slim
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  pip install --no-cache-dir celery[redis]==5.3.4
+                  celery -A tasks worker --loglevel=info --concurrency={{ celery_concurrency }}
+                env:
+                - name: CELERY_BROKER_URL
+                  value: "{{ redis_url }}"
+                - name: CELERY_RESULT_BACKEND
+                  value: "{{ redis_url }}"
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "200m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "1000m"
+                volumeMounts:
+                - name: celery-app
+                  mountPath: /app
+                workingDir: /app
+                livenessProbe:
+                  exec:
+                    command:
+                    - /bin/bash
+                    - -c
+                    - celery -A tasks inspect ping -d celery@$HOSTNAME
+                  initialDelaySeconds: 60
+                  periodSeconds: 30
+                  timeoutSeconds: 10
+              volumes:
+              - name: celery-app
+                configMap:
+                  name: celery-app
+                  defaultMode: 0755
+        ---
+        # Celery Beat (Scheduler) Deployment
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: celery-beat
+          namespace: {{ celery_namespace }}
+          labels:
+            app: celery
+            component: beat
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: celery
+              component: beat
+          template:
+            metadata:
+              labels:
+                app: celery
+                component: beat
+            spec:
+              containers:
+              - name: celery-beat
+                image: python:3.11-slim
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  pip install --no-cache-dir celery[redis]==5.3.4
+                  celery -A tasks beat --loglevel=info -s /app/data/celerybeat-schedule
+                env:
+                - name: CELERY_BROKER_URL
+                  value: "{{ redis_url }}"
+                - name: CELERY_RESULT_BACKEND
+                  value: "{{ redis_url }}"
+                resources:
+                  requests:
+                    memory: "128Mi"
+                    cpu: "100m"
+                  limits:
+                    memory: "256Mi"
+                    cpu: "500m"
+                volumeMounts:
+                - name: celery-app
+                  mountPath: /app
+                - name: beat-data
+                  mountPath: /app/data
+                workingDir: /app
+              volumes:
+              - name: celery-app
+                configMap:
+                  name: celery-app
+                  defaultMode: 0755
+              - name: beat-data
+                emptyDir: {}
+        ---
+        # Celery Flower (Monitoring) Deployment
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: celery-flower
+          namespace: {{ celery_namespace }}
+          labels:
+            app: celery
+            component: flower
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: celery
+              component: flower
+          template:
+            metadata:
+              labels:
+                app: celery
+                component: flower
+            spec:
+              containers:
+              - name: celery-flower
+                image: mher/flower:2.0
+                command:
+                - celery
+                - --broker={{ redis_url }}
+                - flower
+                - --port=5555
+                - --basic-auth=admin:flower123
+                ports:
+                - containerPort: 5555
+                  name: http
+                env:
+                - name: CELERY_BROKER_URL
+                  value: "{{ redis_url }}"
+                - name: CELERY_RESULT_BACKEND
+                  value: "{{ redis_url }}"
+                resources:
+                  requests:
+                    memory: "128Mi"
+                    cpu: "100m"
+                  limits:
+                    memory: "256Mi"
+                    cpu: "500m"
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 5555
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+        ---
+        # Celery Flower Service
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: celery-flower
+          namespace: {{ celery_namespace }}
+          labels:
+            app: celery
+            component: flower
+        spec:
+          type: ClusterIP
+          ports:
+          - port: 5555
+            targetPort: 5555
+            protocol: TCP
+            name: http
+          selector:
+            app: celery
+            component: flower
+        EOF
+      register: celery_deploy
+
+    - name: Create Celery Flower Ingress
+      ansible.builtin.shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: celery-flower
+          namespace: {{ celery_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        spec:
+          ingressClassName: nginx
+          tls:
+          - hosts:
+            - {{ celery_domain }}
+            secretName: {{ celery_secret_name }}
+          rules:
+          - host: {{ celery_domain }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: celery-flower
+                    port:
+                      number: 5555
+        EOF
+      register: ingress_create
+
+    - name: Wait for Celery workers to be ready
+      ansible.builtin.command:
+        cmd: kubectl wait --for=condition=available --timeout=300s deployment/celery-worker -n {{ celery_namespace }}
+      register: worker_ready
+      ignore_errors: yes
+
+    - name: Wait for Celery Flower to be ready
+      ansible.builtin.command:
+        cmd: kubectl wait --for=condition=available --timeout=300s deployment/celery-flower -n {{ celery_namespace }}
+      register: flower_ready
+      ignore_errors: yes
+
+    - name: Get Celery pods status
+      ansible.builtin.command:
+        cmd: kubectl get pods -n {{ celery_namespace }}
+      register: celery_pods
+
+    - name: Display Celery pods
+      ansible.builtin.debug:
+        msg: "{{ celery_pods.stdout_lines }}"
+
+    - name: Get Celery services
+      ansible.builtin.command:
+        cmd: kubectl get svc -n {{ celery_namespace }}
+      register: celery_services
+
+    - name: Display Celery services
+      ansible.builtin.debug:
+        msg: "{{ celery_services.stdout_lines }}"
+
+    - name: Get Celery ingress
+      ansible.builtin.command:
+        cmd: kubectl get ingress -n {{ celery_namespace }}
+      register: celery_ingress
+
+    - name: Display Celery ingress
+      ansible.builtin.debug:
+        msg: "{{ celery_ingress.stdout_lines }}"
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================"
+          - "Celery Installation Complete!"
+          - "========================================"
+          - "Flower Monitoring UI: https://{{ celery_domain }}"
+          - "Username: admin"
+          - "Password: flower123"
+          - ""
+          - "Components deployed:"
+          - "  - {{ celery_workers }}x Celery Workers ({{ celery_concurrency }} concurrency each)"
+          - "  - 1x Celery Beat (scheduler)"
+          - "  - 1x Flower (monitoring)"
+          - ""
+          - "Broker: {{ redis_url }}"
+          - ""
+          - "Next steps:"
+          - "1. Update DNS: {{ celery_domain }} -> K3s master IP"
+          - "2. Access Flower at https://{{ celery_domain }}"
+          - "3. Replace tasks.py ConfigMap with your tasks"
+          - ""
+          - "To update tasks:"
+          - "  kubectl edit configmap celery-app -n {{ celery_namespace }}"
+          - "  kubectl rollout restart deployment/celery-worker -n {{ celery_namespace }}"
+          - "  kubectl rollout restart deployment/celery-beat -n {{ celery_namespace }}"
+          - ""
+          - "To check status:"
+          - "  kubectl get pods -n {{ celery_namespace }}"
+          - "  kubectl logs -n {{ celery_namespace }} -l component=worker"
+          - ""
+          - "To test tasks (from Python):"
+          - "  from tasks import add"
+          - "  result = add.delay(4, 4)"
+          - "  print(result.get())"
