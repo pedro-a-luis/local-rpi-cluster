@@ -1,0 +1,309 @@
+version: '3.8'
+
+networks:
+  homelab:
+    name: homelab
+    driver: bridge
+
+volumes:
+  postgres_data:
+  nextcloud_data:
+  nextcloud_apps:
+  nextcloud_config:
+  redis_nextcloud_data:
+  vaultwarden_data:
+  portainer_data:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:
+  openproject_pgdata:
+  openproject_assets:
+
+services:
+  # =============================================================================
+  # SHARED DATABASE - PostgreSQL 15
+  # =============================================================================
+  postgres-shared:
+    image: postgres:${POSTGRES_VERSION:-15}
+    container_name: postgres-shared
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_ROOT_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # NEXTCLOUD - File Sharing & Collaboration
+  # =============================================================================
+  nextcloud-redis:
+    image: redis:alpine
+    container_name: nextcloud-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_NEXTCLOUD_PASSWORD}
+    volumes:
+      - redis_nextcloud_data:/data
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nextcloud:
+    image: nextcloud:31.0.7
+    container_name: nextcloud
+    restart: unless-stopped
+    depends_on:
+      postgres-shared:
+        condition: service_healthy
+      nextcloud-redis:
+        condition: service_healthy
+    environment:
+      # Database
+      POSTGRES_HOST: postgres-shared
+      POSTGRES_DB: ${DB_NEXTCLOUD}
+      POSTGRES_USER: ${DB_USER_NEXTCLOUD}
+      POSTGRES_PASSWORD: ${DB_PASS_NEXTCLOUD}
+
+      # Redis
+      REDIS_HOST: nextcloud-redis
+      REDIS_HOST_PASSWORD: ${REDIS_NEXTCLOUD_PASSWORD}
+
+      # Admin account
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+
+      # Trusted domains (add your domain)
+      NEXTCLOUD_TRUSTED_DOMAINS: nextcloud.stratdata.org localhost
+
+      # Other
+      OVERWRITEPROTOCOL: https
+      TRUSTED_PROXIES: 172.26.0.0/16
+      TZ: ${TZ}
+    volumes:
+      - nextcloud_data:/var/www/html/data
+      - nextcloud_apps:/var/www/html/custom_apps
+      - nextcloud_config:/var/www/html/config
+    ports:
+      - "${PORT_NEXTCLOUD}:80"
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nextcloud-cron:
+    image: nextcloud:31.0.7
+    container_name: nextcloud-cron
+    restart: unless-stopped
+    depends_on:
+      - nextcloud
+    volumes:
+      - nextcloud_data:/var/www/html/data
+      - nextcloud_apps:/var/www/html/custom_apps
+      - nextcloud_config:/var/www/html/config
+    entrypoint: /cron.sh
+    networks:
+      - homelab
+
+  # =============================================================================
+  # VAULTWARDEN - Password Manager (Bitwarden-compatible)
+  # =============================================================================
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    depends_on:
+      postgres-shared:
+        condition: service_healthy
+    environment:
+      # Database - NOTE: postgres-shared listens on 5432 internally
+      DATABASE_URL: postgresql://${DB_USER_BITWARDEN}:${DB_PASS_BITWARDEN}@postgres-shared:5432/${DB_BITWARDEN}
+
+      # Admin panel
+      ADMIN_TOKEN: ${BITWARDEN_ADMIN_TOKEN}
+
+      # Domain configuration
+      DOMAIN: https://bitwarden.stratdata.org
+
+      # Security
+      SIGNUPS_ALLOWED: false
+      INVITATIONS_ALLOWED: true
+      SHOW_PASSWORD_HINT: false
+
+      # Database connection
+      DATABASE_MAX_CONNS: 10
+
+      TZ: ${TZ}
+    volumes:
+      - vaultwarden_data:/data
+    ports:
+      - "${PORT_BITWARDEN}:80"
+      - "3012:3012"  # WebSocket notifications
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # PORTAINER - Docker Management UI
+  # =============================================================================
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+      - "8000:8000"
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # GITLAB - Git Repository & DevOps Platform
+  # =============================================================================
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    container_name: gitlab
+    restart: unless-stopped
+    hostname: gitlab.stratdata.org
+    depends_on:
+      postgres-shared:
+        condition: service_healthy
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://gitlab.stratdata.org'
+
+        # PostgreSQL (external database)
+        postgresql['enable'] = false
+        gitlab_rails['db_adapter'] = 'postgresql'
+        gitlab_rails['db_encoding'] = 'utf8'
+        gitlab_rails['db_host'] = 'postgres-shared'
+        gitlab_rails['db_port'] = 5432
+        gitlab_rails['db_database'] = '${DB_GITLAB}'
+        gitlab_rails['db_username'] = '${DB_USER_GITLAB}'
+        gitlab_rails['db_password'] = '${DB_PASS_GITLAB}'
+
+        # GitLab initial root password
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD}'
+
+        # Disable unused services
+        prometheus_monitoring['enable'] = false
+        alertmanager['enable'] = false
+        grafana['enable'] = false
+
+        # Performance tuning for limited resources
+        puma['worker_processes'] = 2
+        sidekiq['max_concurrency'] = 10
+
+        # Timezone
+        gitlab_rails['time_zone'] = '${TZ}'
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    ports:
+      - "${PORT_GITLAB}:80"
+      - "2222:22"  # SSH for git
+    networks:
+      - homelab
+    shm_size: '256m'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/-/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 120s
+
+  # =============================================================================
+  # OPENPROJECT - Project Management
+  # =============================================================================
+  openproject:
+    image: openproject/community:latest
+    container_name: openproject
+    restart: unless-stopped
+    depends_on:
+      postgres-shared:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgres://${DB_USER_OPENPROJECT}:${DB_PASS_OPENPROJECT}@postgres-shared:5432/${DB_OPENPROJECT}
+
+      # Rails
+      SECRET_KEY_BASE: ${OPENPROJECT_SECRET_KEY_BASE}
+      RAILS_CACHE_STORE: memcache
+
+      # Admin
+      OPENPROJECT_ADMIN__EMAIL: ${OPENPROJECT_ADMIN_EMAIL}
+      OPENPROJECT_ADMIN__PASSWORD: ${OPENPROJECT_ADMIN_PASSWORD}
+
+      # Host
+      OPENPROJECT_HOST__NAME: openproject.stratdata.org
+      OPENPROJECT_HTTPS: "true"
+
+      TZ: ${TZ}
+    volumes:
+      - openproject_pgdata:/var/openproject/pgdata
+      - openproject_assets:/var/openproject/assets
+    ports:
+      - "${PORT_OPENPROJECT}:80"
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health_checks/default"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =============================================================================
+  # IMMICH - Photo Management
+  # =============================================================================
+  # Note: Immich requires additional services (Redis, ML, etc.)
+  # This is a simplified version - expand as needed
+
+  # =============================================================================
+  # STIRLING-PDF - PDF Tools
+  # =============================================================================
+  stirling-pdf:
+    image: frooodle/s-pdf:latest
+    container_name: stirling-pdf
+    restart: unless-stopped
+    environment:
+      DOCKER_ENABLE_SECURITY: "false"
+      TZ: ${TZ}
+    ports:
+      - "${PORT_STIRLING_PDF}:8080"
+    networks:
+      - homelab
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

@@ -1,0 +1,160 @@
+---
+# Ansible Playbook: Install Apache Airflow in K3s Cluster
+#
+# This playbook installs Apache Airflow using Helm chart with KubernetesExecutor.
+#
+# Usage:
+#   ansible-playbook playbooks/airflow-install.yml
+#
+# Requirements:
+#   - Helm installed
+#   - kubectl configured
+#   - Longhorn storage class available
+
+- name: Install Apache Airflow in K3s Cluster
+  hosts: localhost
+  gather_facts: no
+  vars:
+    airflow_namespace: "airflow"
+    airflow_domain: "airflow.stratdata.org"
+    airflow_secret_name: "stratdata-wildcard-tls"
+    helm_repo_name: "apache-airflow"
+    helm_repo_url: "https://airflow.apache.org"
+    helm_chart: "apache-airflow/airflow"
+    helm_release: "airflow"
+
+  tasks:
+    - name: Add Apache Airflow Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add {{ helm_repo_name }} {{ helm_repo_url }}
+      register: helm_repo_add
+      changed_when: "'already exists' not in helm_repo_add.stderr"
+      failed_when: helm_repo_add.rc != 0 and 'already exists' not in helm_repo_add.stderr
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      register: helm_repo_update
+
+    - name: Create Airflow namespace
+      ansible.builtin.command:
+        cmd: kubectl create namespace {{ airflow_namespace }}
+      register: namespace_create
+      changed_when: namespace_create.rc == 0
+      failed_when: namespace_create.rc != 0 and 'already exists' not in namespace_create.stderr
+
+    - name: Copy TLS certificate to Airflow namespace
+      ansible.builtin.shell: |
+        kubectl get secret {{ airflow_secret_name }} -n monitoring -o yaml | \
+        sed 's/namespace: monitoring/namespace: {{ airflow_namespace }}/' | \
+        kubectl apply -f -
+      register: tls_copy
+      ignore_errors: yes
+
+    - name: Install Airflow using Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install {{ helm_release }} {{ helm_chart }}
+          --namespace {{ airflow_namespace }}
+          --set executor=KubernetesExecutor
+          --set postgresql.enabled=true
+          --set postgresql.auth.password=airflow123
+          --set webserver.service.type=ClusterIP
+          --set dags.persistence.enabled=true
+          --set dags.persistence.size=5Gi
+          --set dags.persistence.storageClassName=longhorn
+          --set logs.persistence.enabled=true
+          --set logs.persistence.size=10Gi
+          --set logs.persistence.storageClassName=longhorn
+          --set webserver.defaultUser.enabled=true
+          --set webserver.defaultUser.username=admin
+          --set webserver.defaultUser.password=admin123
+          --timeout 15m
+          --wait
+      register: airflow_install
+      async: 1800
+      poll: 30
+
+    - name: Create Airflow Ingress
+      ansible.builtin.shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: airflow-webserver
+          namespace: {{ airflow_namespace }}
+          annotations:
+            nginx.ingress.kubernetes.io/rewrite-target: /
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        spec:
+          ingressClassName: nginx
+          tls:
+          - hosts:
+            - {{ airflow_domain }}
+            secretName: {{ airflow_secret_name }}
+          rules:
+          - host: {{ airflow_domain }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: {{ helm_release }}-webserver
+                    port:
+                      number: 8080
+        EOF
+      register: ingress_create
+
+    - name: Wait for Airflow webserver to be ready
+      ansible.builtin.command:
+        cmd: kubectl wait --for=condition=available --timeout=600s deployment/{{ helm_release }}-webserver -n {{ airflow_namespace }}
+      register: webserver_ready
+      ignore_errors: yes
+
+    - name: Get Airflow pods status
+      ansible.builtin.command:
+        cmd: kubectl get pods -n {{ airflow_namespace }}
+      register: airflow_pods
+
+    - name: Display Airflow pods
+      ansible.builtin.debug:
+        msg: "{{ airflow_pods.stdout_lines }}"
+
+    - name: Get Airflow services
+      ansible.builtin.command:
+        cmd: kubectl get svc -n {{ airflow_namespace }}
+      register: airflow_services
+
+    - name: Display Airflow services
+      ansible.builtin.debug:
+        msg: "{{ airflow_services.stdout_lines }}"
+
+    - name: Get Airflow ingress
+      ansible.builtin.command:
+        cmd: kubectl get ingress -n {{ airflow_namespace }}
+      register: airflow_ingress
+
+    - name: Display Airflow ingress
+      ansible.builtin.debug:
+        msg: "{{ airflow_ingress.stdout_lines }}"
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================"
+          - "Apache Airflow Installation Complete!"
+          - "========================================"
+          - "Airflow Web UI: https://{{ airflow_domain }}"
+          - "Username: admin"
+          - "Password: admin123"
+          - ""
+          - "Next steps:"
+          - "1. Add DNS entry: {{ airflow_domain }} -> K3s master IP"
+          - "2. Access the web UI at https://{{ airflow_domain }}"
+          - "3. Upload your DAGs to the DAGs folder"
+          - ""
+          - "To check status:"
+          - "  kubectl get pods -n {{ airflow_namespace }}"
+          - "  kubectl get svc -n {{ airflow_namespace }}"
+          - "  kubectl logs -n {{ airflow_namespace }} -l component=webserver"

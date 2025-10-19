@@ -1,0 +1,219 @@
+---
+# Cluster Startup Playbook - Ansible automation
+# Usage: ansible-playbook ansible/playbooks/cluster-startup.yml
+# This playbook performs cluster startup and health verification
+
+- name: Startup Preparation
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Display startup message
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                    CLUSTER STARTUP INITIATED
+          ═══════════════════════════════════════════════════════════
+          This will start the K3s cluster and verify health.
+
+- name: Check Master Node Connectivity
+  hosts: master
+  gather_facts: no
+
+  tasks:
+    - name: Wait for master node to be online
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 0
+        timeout: 300
+      delegate_to: localhost
+
+    - name: Test SSH connectivity
+      ping:
+
+- name: Start K3s Server on Master
+  hosts: master
+  become: yes
+
+  tasks:
+    - name: Start K3s server
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: Wait for K3s server to initialize
+      pause:
+        seconds: 120
+
+    - name: Wait for K3s API to be ready
+      command: kubectl get nodes
+      register: k3s_ready
+      until: k3s_ready.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Display K3s server status
+      command: systemctl status k3s
+      register: k3s_status
+      changed_when: false
+
+    - name: Show K3s status
+      debug:
+        var: k3s_status.stdout_lines
+
+- name: Check Worker Nodes Connectivity
+  hosts: workers
+  gather_facts: no
+  serial: 1
+
+  tasks:
+    - name: Wait for worker node to be online
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 0
+        timeout: 300
+      delegate_to: localhost
+
+    - name: Test SSH connectivity
+      ping:
+
+- name: Start K3s Agents on Workers
+  hosts: workers
+  become: yes
+  serial: 1
+
+  tasks:
+    - name: Start K3s agent
+      systemd:
+        name: k3s-agent
+        state: started
+        enabled: yes
+
+    - name: Wait for agent to join cluster
+      pause:
+        seconds: 60
+
+    - name: Check if node joined cluster
+      command: ssh -i ~/.ssh/pi_cluster admin@192.168.1.240 'kubectl get node {{ inventory_hostname }}'
+      register: node_status
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Display node status
+      debug:
+        var: node_status.stdout_lines
+      delegate_to: localhost
+
+- name: Uncordon All Nodes
+  hosts: localhost
+  gather_facts: no
+  vars:
+    master_node: "192.168.1.240"
+
+  tasks:
+    - name: Uncordon master node
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl uncordon pi-master'
+      ignore_errors: yes
+
+    - name: Uncordon worker nodes
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl uncordon pi-worker-0{{ item }}'
+      loop: [1, 2, 3, 4, 5, 6, 7]
+      ignore_errors: yes
+
+    - name: Wait for pods to stabilize
+      pause:
+        seconds: 60
+
+- name: Cluster Health Verification
+  hosts: localhost
+  gather_facts: no
+  vars:
+    master_node: "192.168.1.240"
+
+  tasks:
+    - name: Get node status
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl get nodes'
+      register: nodes
+      changed_when: false
+
+    - name: Display node status
+      debug:
+        var: nodes.stdout_lines
+
+    - name: Check system pods
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl get pods -n kube-system'
+      register: system_pods
+      changed_when: false
+
+    - name: Display system pods
+      debug:
+        var: system_pods.stdout_lines
+
+    - name: Check Longhorn storage
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl get nodes.longhorn.io -n longhorn-system'
+      register: longhorn
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display Longhorn status
+      debug:
+        var: longhorn.stdout_lines
+      when: longhorn.rc == 0
+
+    - name: Check monitoring namespace
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl get pods -n monitoring'
+      register: monitoring
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display monitoring status
+      debug:
+        var: monitoring.stdout_lines
+      when: monitoring.rc == 0
+
+    - name: Check Velero backup location
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'velero backup-location get'
+      register: velero
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display Velero status
+      debug:
+        var: velero.stdout_lines
+      when: velero.rc == 0
+
+    - name: Check for failed pods
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl get pods -A | grep -E "Error|CrashLoop|ImagePullBackOff" || echo "No failed pods"'
+      register: failed_pods
+      changed_when: false
+
+    - name: Display failed pods
+      debug:
+        var: failed_pods.stdout_lines
+
+- name: Startup Complete
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Display completion message
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                    CLUSTER STARTUP COMPLETE
+          ═══════════════════════════════════════════════════════════
+
+          Services:
+          - Grafana: https://grafana.stratdata.org
+          - Longhorn: https://longhorn.stratdata.org
+          - MinIO: https://minio-console.stratdata.org
+          - Loki: https://loki.stratdata.org
+
+          Next steps:
+          - Verify all services are accessible
+          - Check pod status: kubectl get pods -A
+          - Review logs if needed
+          ═══════════════════════════════════════════════════════════

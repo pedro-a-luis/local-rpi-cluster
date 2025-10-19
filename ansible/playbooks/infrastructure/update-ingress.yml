@@ -25,6 +25,9 @@
       - name: "codeserver"
         namespace: "dev-tools"
         host: "code.{{ domain }}"
+      - name: "airflow-webserver"
+        namespace: "airflow"
+        host: "airflow.{{ domain }}"
 
   tasks:
     - name: Get current ingress configuration

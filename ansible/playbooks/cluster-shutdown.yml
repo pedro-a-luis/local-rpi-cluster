@@ -1,0 +1,163 @@
+---
+# Cluster Shutdown Playbook - Ansible automation
+# Usage: ansible-playbook ansible/playbooks/cluster-shutdown.yml
+# This playbook performs graceful cluster shutdown
+
+- name: Pre-Shutdown Backups and Preparation
+  hosts: localhost
+  gather_facts: no
+  vars:
+    backup_before_shutdown: true
+    drain_timeout: 300
+
+  tasks:
+    - name: Display shutdown warning
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                    CLUSTER SHUTDOWN INITIATED
+          ═══════════════════════════════════════════════════════════
+          This will shut down the entire K3s cluster.
+          All services will be stopped.
+
+    - name: Confirm shutdown
+      pause:
+        prompt: "Are you sure you want to shutdown the cluster? (yes/no)"
+      register: confirm
+
+    - name: Check confirmation
+      fail:
+        msg: "Shutdown cancelled"
+      when: confirm.user_input | lower != 'yes'
+
+    - name: Create etcd snapshot
+      command: ssh -i ~/.ssh/pi_cluster admin@192.168.1.240 'sudo k3s etcd-snapshot save --name pre-shutdown-{{ ansible_date_time.epoch }}'
+      ignore_errors: yes
+
+    - name: Create Velero backup
+      command: ssh -i ~/.ssh/pi_cluster admin@192.168.1.240 'velero backup create pre-shutdown-{{ ansible_date_time.epoch }} --wait --timeout=10m'
+      when: backup_before_shutdown
+      ignore_errors: yes
+
+- name: Cordon and Drain Nodes
+  hosts: localhost
+  gather_facts: no
+  vars:
+    master_node: "192.168.1.240"
+    drain_timeout: 300
+
+  tasks:
+    - name: Get current nodes
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl get nodes -o name'
+      register: nodes
+      changed_when: false
+
+    - name: Display nodes
+      debug:
+        var: nodes.stdout_lines
+
+    - name: Cordon all worker nodes
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl cordon pi-worker-0{{ item }}'
+      loop: [1, 2, 3, 4, 5, 6, 7]
+      ignore_errors: yes
+
+    - name: Cordon master node
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl cordon pi-master'
+      ignore_errors: yes
+
+    - name: Drain worker nodes
+      command: ssh -i ~/.ssh/pi_cluster admin@{{ master_node }} 'kubectl drain pi-worker-0{{ item }} --ignore-daemonsets --delete-emptydir-data --timeout={{ drain_timeout }}s --force'
+      loop: [1, 2, 3, 4, 5, 6, 7]
+      ignore_errors: yes
+
+    - name: Wait for pods to migrate
+      pause:
+        seconds: 30
+
+- name: Stop K3s Services
+  hosts: workers
+  become: yes
+  serial: 1
+
+  tasks:
+    - name: Stop K3s agent
+      systemd:
+        name: k3s-agent
+        state: stopped
+
+    - name: Wait after stopping agent
+      pause:
+        seconds: 5
+
+- name: Stop K3s Server
+  hosts: master
+  become: yes
+
+  tasks:
+    - name: Stop K3s server
+      systemd:
+        name: k3s
+        state: stopped
+
+    - name: Wait after stopping server
+      pause:
+        seconds: 10
+
+- name: Shutdown Worker Nodes
+  hosts: workers
+  become: yes
+  serial: 1
+
+  tasks:
+    - name: Shutdown worker node
+      command: shutdown -h now
+      async: 0
+      poll: 0
+      ignore_errors: yes
+
+    - name: Wait between worker shutdowns
+      pause:
+        seconds: 5
+      delegate_to: localhost
+
+- name: Shutdown Master Node
+  hosts: master
+  become: yes
+
+  tasks:
+    - name: Display final warning
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                      SHUTTING DOWN MASTER NODE
+          ═══════════════════════════════════════════════════════════
+          Master node will shutdown in 10 seconds
+      delegate_to: localhost
+
+    - name: Wait before master shutdown
+      pause:
+        seconds: 10
+      delegate_to: localhost
+
+    - name: Shutdown master node
+      command: shutdown -h now
+      async: 0
+      poll: 0
+      ignore_errors: yes
+
+- name: Shutdown Complete
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Display completion message
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                    CLUSTER SHUTDOWN COMPLETE
+          ═══════════════════════════════════════════════════════════
+          All nodes have been shut down gracefully.
+
+          To restart the cluster:
+          ansible-playbook ansible/playbooks/cluster-startup.yml
+          ═══════════════════════════════════════════════════════════

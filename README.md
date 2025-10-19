@@ -6,8 +6,10 @@ Infrastructure automation and documentation for an 8-node Raspberry Pi 5 Kuberne
 
 **Access Services**:
 - Grafana: https://grafana.stratdata.org (admin/Grafana123)
+- Loki: https://loki.stratdata.org
 - Longhorn: https://longhorn.stratdata.org
 - Code Server: https://code.stratdata.org
+- Airflow: https://airflow.stratdata.org (admin/admin123)
 
 **SSH Access**:
 ```bash
@@ -36,6 +38,10 @@ ssh -i ~/.ssh/pi_cluster admin@192.168.1.240
 - **Loki + Promtail**: Logging
 - **Cert-Manager**: Certificate management
 - **NFS Provisioner**: External storage (7.3TB)
+- **Apache Airflow**: Workflow orchestration
+- **Velero**: Kubernetes backup and disaster recovery
+- **MinIO**: S3-compatible object storage (500GB)
+- **PostgreSQL 16**: ARM64-compatible database
 
 ### Security
 - Let's Encrypt wildcard certificate (`*.stratdata.org`)
@@ -44,27 +50,39 @@ ssh -i ~/.ssh/pi_cluster admin@192.168.1.240
 
 ## Documentation
 
-### Getting Started
-- **[cluster-access-guide.md](cluster-access-guide.md)** - Service URLs, credentials, quick commands
-- **[dns-setup-guide.md](dns-setup-guide.md)** - DNS configuration and troubleshooting
+**[Complete Documentation Index](docs/README.md)** - All documentation organized by category
 
-### Security
-- **[SECURITY-AUDIT.md](SECURITY-AUDIT.md)** - Complete security assessment report
-- **[SECURITY-REMEDIATION-GUIDE.md](SECURITY-REMEDIATION-GUIDE.md)** - Step-by-step remediation guide
+### Getting Started
+- **[Cluster Access Guide](docs/getting-started/cluster-access-guide.md)** - Service URLs, credentials, quick commands
+- **[DNS Setup Guide](docs/getting-started/dns-setup-guide.md)** - DNS configuration and troubleshooting
+
+### Deployment Guides
+- **[Airflow Deployment](docs/deployment/airflow.md)** - Apache Airflow deployment and management
+- **[PostgreSQL Deployment](docs/deployment/postgresql.md)** - PostgreSQL ARM64 deployment guide
 
 ### Operations
-- **[ANSIBLE.md](ANSIBLE.md)** - Complete Ansible automation guide
+- **[Ansible Guide](docs/operations/ansible-guide.md)** - Complete Ansible automation guide
   - Cluster-level operations (on pi-master)
   - Infrastructure operations (this repo)
   - Common workflows and troubleshooting
+- **[Backup & Recovery](docs/operations/backup-recovery.md)** - Comprehensive backup and disaster recovery guide
+- **[Cluster Lifecycle](docs/operations/cluster-lifecycle.md)** - Safe cluster shutdown and startup procedures
+
+### Security
+- **[Security Audit](docs/security/audit.md)** - Complete security assessment report
+- **[Remediation Guide](docs/security/remediation.md)** - Step-by-step remediation guide
 
 ### Development
-- **[claude.md](claude.md)** - Development guidelines and cluster overview
+- **[Claude Guidelines](docs/development/claude-guidelines.md)** - Development guidelines and cluster overview
+
+### Roadmap
+- **[Improvements Roadmap](docs/roadmap/improvements.md)** - Infrastructure improvements tracker
 
 ### Automation
-- **[ansible/README.md](ansible/README.md)** - Complete Ansible automation guide (24 playbooks, 5 roles)
-- **[ansible/playbooks/infrastructure/README.md](ansible/playbooks/infrastructure/README.md)** - Infrastructure playbook details
-- **[ansible/playbooks/security/](ansible/playbooks/security/)** - Security hardening playbooks
+- **[Ansible README](ansible/README.md)** - Complete Ansible automation guide (24 playbooks, 5 roles)
+- **[Infrastructure Playbooks](ansible/playbooks/infrastructure/README.md)** - Infrastructure playbook details
+- **[Security Playbooks](ansible/playbooks/security/)** - Security hardening playbooks
+- **[Scripts Directory](scripts/README.md)** - Cluster management and deployment scripts
 
 ## Common Tasks
 
@@ -144,7 +162,8 @@ Router (192.168.1.1)
 │  ├─ Traefik Ingress                     │
 │  │   ├─ grafana.stratdata.org           │
 │  │   ├─ longhorn.stratdata.org          │
-│  │   └─ code.stratdata.org              │
+│  │   ├─ code.stratdata.org              │
+│  │   └─ airflow.stratdata.org           │
 │  └─ Worker Nodes (192.168.1.241-247)    │
 │                                          │
 │  Synology DS118 (192.168.1.10)          │
@@ -157,39 +176,67 @@ Router (192.168.1.1)
 ```
 ~/gitlab/local-rpi-cluster/
 ├── README.md                    # This file
-├── ANSIBLE.md                   # Complete Ansible documentation
-├── claude.md                    # Development guidelines
-├── cluster-access-guide.md      # Service access and credentials
-├── dns-setup-guide.md           # DNS configuration
-├── cluster-init.sh              # Full cluster initialization script
-├── monitor-deployment.sh        # Deployment monitoring script
-└── ansible/                     # Complete Ansible automation (unified)
-    ├── README.md                # Ansible overview and quick reference
-    ├── ansible.cfg              # Ansible configuration
-    ├── requirements.txt         # Python dependencies
-    ├── inventory/
-    │   └── hosts.yml            # Master + 7 worker nodes
-    ├── group_vars/              # Group variables
-    ├── vars/                    # Additional variables
-    ├── roles/                   # 5 Ansible roles
-    │   ├── backup/              # Backup automation
-    │   ├── base/                # Base system config
-    │   ├── k3s/                 # K3s installation
-    │   ├── k3s_storage/         # Storage configuration
-    │   └── nfs/                 # NFS client setup
-    └── playbooks/               # All playbooks (24 total)
-        ├── infrastructure/      # DNS, certs, ingress (3 playbooks)
-        │   ├── README.md
-        │   ├── update-certificates.yml
-        │   ├── update-dns-zone.yml
-        │   ├── update-ingress.yml
-        │   └── templates/dns-zone.j2
-        └── (21 cluster playbooks)  # K3s cluster management
+├── .env                         # Environment variables (gitignored)
+├── docs/                        # All documentation
+│   ├── README.md                # Documentation index
+│   ├── getting-started/         # Initial setup guides
+│   │   ├── cluster-access-guide.md
+│   │   └── dns-setup-guide.md
+│   ├── deployment/              # Service deployment guides
+│   │   ├── airflow.md
+│   │   └── postgresql.md
+│   ├── operations/              # Operational guides
+│   │   ├── ansible-guide.md
+│   │   ├── backup-recovery.md
+│   │   └── cluster-lifecycle.md
+│   ├── security/                # Security documentation
+│   │   ├── audit.md
+│   │   └── remediation.md
+│   ├── development/             # Development guidelines
+│   │   └── claude-guidelines.md
+│   └── roadmap/                 # Planning documents
+│       └── improvements.md
+├── scripts/                     # Automation scripts
+│   ├── README.md                # Scripts documentation
+│   ├── cluster/                 # Cluster management
+│   │   ├── init.sh
+│   │   ├── shutdown.sh
+│   │   └── startup.sh
+│   └── deployment/              # Service deployment
+│       ├── deploy-airflow.sh
+│       └── monitor.sh
+├── config/                      # Configuration files
+│   ├── README.md                # Configuration guide
+│   └── .env.example             # Environment template
+├── ansible/                     # Complete Ansible automation
+│   ├── README.md                # Ansible overview
+│   ├── ansible.cfg              # Ansible configuration
+│   ├── requirements.txt         # Python dependencies
+│   ├── inventory/
+│   │   └── hosts.yml            # Master + 7 worker nodes
+│   ├── group_vars/              # Group variables
+│   ├── vars/                    # Additional variables
+│   ├── roles/                   # 5 Ansible roles
+│   │   ├── backup/              # Backup automation
+│   │   ├── base/                # Base system config
+│   │   ├── k3s/                 # K3s installation
+│   │   ├── k3s_storage/         # Storage configuration
+│   │   └── nfs/                 # NFS client setup
+│   └── playbooks/               # All playbooks (24 total)
+│       ├── infrastructure/      # DNS, certs, ingress (3 playbooks)
+│       │   ├── README.md
+│       │   ├── update-certificates.yml
+│       │   ├── update-dns-zone.yml
+│       │   ├── update-ingress.yml
+│       │   └── templates/dns-zone.j2
+│       └── (21 cluster playbooks)  # K3s cluster management
+└── docker/                      # Container definitions (if any)
 ```
 
 **Notes**:
 - **Infrastructure playbooks** (`ansible/playbooks/infrastructure/`) - Run from anywhere
 - **Cluster playbooks** (`ansible/playbooks/*.yml`) - Run on pi-master
+- **Scripts** - Bash automation for cluster lifecycle and deployments
 - Active cluster Ansible lives at `/home/admin/ansible/` on pi-master (192.168.1.240)
 
 ## Troubleshooting
@@ -219,6 +266,7 @@ Router (192.168.1.1)
    192.168.1.240  grafana.stratdata.org
    192.168.1.240  longhorn.stratdata.org
    192.168.1.240  code.stratdata.org
+   192.168.1.240  airflow.stratdata.org
    ```
    - Remove `#` at the start (makes them comments)
    - Flush DNS: `ipconfig /flushdns`
@@ -262,7 +310,7 @@ cd /home/admin/ansible
 ansible-playbook playbooks/k3s-app-status.yml
 ```
 
-See [ANSIBLE.md](ANSIBLE.md) for more troubleshooting playbooks.
+See [Ansible Guide](docs/operations/ansible-guide.md) for more troubleshooting playbooks.
 
 ## Maintenance Schedule
 
@@ -289,10 +337,10 @@ See [ANSIBLE.md](ANSIBLE.md) for more troubleshooting playbooks.
 ## Support
 
 For issues or questions:
-1. Check documentation in this repository
+1. Check [documentation index](docs/README.md)
 2. Review logs in Grafana/Loki
 3. Check cluster status playbooks
-4. Consult [ANSIBLE.md](ANSIBLE.md) for automation
+4. Consult [Ansible Guide](docs/operations/ansible-guide.md) for automation
 
 ## License
 

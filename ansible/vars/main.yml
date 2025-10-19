@@ -108,3 +108,27 @@ apps:
     dangerous: false
     description: "Certificate management for Kubernetes"
     install: false  # Set to true when you want to install this app
+
+  # Apache Airflow - Workflow Orchestration
+  airflow:
+    namespace: "airflow"
+    helm_release: "airflow"
+    helm_chart: "apache-airflow/airflow"
+    helm_options: "--set executor=KubernetesExecutor --set postgresql.enabled=true --set postgresql.auth.password=airflow123 --set webserver.service.type=ClusterIP --set dags.persistence.enabled=true --set dags.persistence.size=5Gi --set dags.persistence.storageClassName=longhorn --set logs.persistence.enabled=true --set logs.persistence.size=10Gi --set logs.persistence.storageClassName=longhorn --set webserver.defaultUser.enabled=true --set webserver.defaultUser.username=admin --set webserver.defaultUser.password=admin123"
+    install_timeout: "900s"
+    manifest_method: false
+    cleanup_resources:
+      - "deployments"
+      - "statefulsets"
+      - "services"
+      - "configmaps"
+      - "secrets"
+      - "persistentvolumeclaims"
+      - "jobs"
+      - "serviceaccounts"
+      - "roles"
+      - "rolebindings"
+    removal_timeout: 600
+    dangerous: true
+    description: "Apache Airflow workflow orchestration platform (CAUTION: Removing will delete DAGs and logs)"
+    install: true  # Set to true when you want to install this app

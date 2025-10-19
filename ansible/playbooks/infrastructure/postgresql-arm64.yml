@@ -1,0 +1,231 @@
+---
+# Deploy ARM64-compatible PostgreSQL - ansible/playbooks/infrastructure/postgresql-arm64.yml
+# This playbook deploys PostgreSQL using official ARM64-compatible images
+
+- name: Deploy ARM64-compatible PostgreSQL to K3s cluster
+  hosts: localhost
+  gather_facts: no
+  vars:
+    namespace: databases
+    postgres_image: "postgres:16-alpine"
+    postgres_password: "{{ lookup('env', 'POSTGRES_PASSWORD') | default('postgres123', true) }}"
+    app_user: "appuser"
+    app_password: "{{ lookup('env', 'APP_PASSWORD') | default('appuser123', true) }}"
+    app_database: "appdb"
+    replication_user: "repl_user"
+    replication_password: "{{ lookup('env', 'REPL_PASSWORD') | default('repl123', true) }}"
+    storage_size: "20Gi"
+    storage_class: "longhorn"
+
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          =================================================
+          DEPLOYING ARM64-COMPATIBLE POSTGRESQL
+          =================================================
+          Namespace: {{ namespace }}
+          Image: {{ postgres_image }}
+          Storage: {{ storage_size }} ({{ storage_class }})
+          Database: {{ app_database }}
+          User: {{ app_user }}
+          =================================================
+
+    - name: Ensure namespace exists
+      command: kubectl create namespace {{ namespace }} --dry-run=client -o yaml
+      register: namespace_yaml
+      changed_when: false
+
+    - name: Apply namespace
+      shell: |
+        echo '{{ namespace_yaml.stdout }}' | kubectl apply -f -
+
+    - name: Create PostgreSQL primary StatefulSet manifest
+      copy:
+        content: |
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgresql-primary
+            namespace: {{ namespace }}
+            labels:
+              app: postgresql
+              role: primary
+          spec:
+            type: ClusterIP
+            ports:
+              - name: postgresql
+                port: 5432
+                targetPort: 5432
+            selector:
+              app: postgresql
+              role: primary
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgresql-primary-hl
+            namespace: {{ namespace }}
+            labels:
+              app: postgresql
+              role: primary
+          spec:
+            type: ClusterIP
+            clusterIP: None
+            ports:
+              - name: postgresql
+                port: 5432
+                targetPort: 5432
+            selector:
+              app: postgresql
+              role: primary
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: postgresql-primary
+            namespace: {{ namespace }}
+            labels:
+              app: postgresql
+              role: primary
+          spec:
+            serviceName: postgresql-primary-hl
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgresql
+                role: primary
+            template:
+              metadata:
+                labels:
+                  app: postgresql
+                  role: primary
+              spec:
+                securityContext:
+                  fsGroup: 999
+                containers:
+                  - name: postgresql
+                    image: {{ postgres_image }}
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - name: postgresql
+                        containerPort: 5432
+                    env:
+                      - name: POSTGRES_USER
+                        value: "{{ app_user }}"
+                      - name: POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql
+                            key: password
+                      - name: POSTGRES_DB
+                        value: "{{ app_database }}"
+                      - name: PGDATA
+                        value: /var/lib/postgresql/data/pgdata
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/postgresql/data
+                    resources:
+                      requests:
+                        cpu: 200m
+                        memory: 512Mi
+                      limits:
+                        cpu: 1
+                        memory: 1Gi
+                    livenessProbe:
+                      exec:
+                        command:
+                          - /bin/sh
+                          - -c
+                          - pg_isready -U {{ app_user }} -d {{ app_database }}
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 6
+                    readinessProbe:
+                      exec:
+                        command:
+                          - /bin/sh
+                          - -c
+                          - pg_isready -U {{ app_user }} -d {{ app_database }}
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 6
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                spec:
+                  accessModes:
+                    - ReadWriteOnce
+                  storageClassName: {{ storage_class }}
+                  resources:
+                    requests:
+                      storage: {{ storage_size }}
+        dest: /tmp/postgresql-primary.yaml
+
+    - name: Apply PostgreSQL primary deployment
+      command: kubectl apply -f /tmp/postgresql-primary.yaml
+      register: apply_result
+
+    - name: Display apply result
+      debug:
+        var: apply_result.stdout_lines
+
+    - name: Wait for PostgreSQL primary to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=postgresql,role=primary -n {{ namespace }} --timeout=300s
+      register: wait_result
+      retries: 3
+      delay: 10
+      until: wait_result.rc == 0
+
+    - name: Get PostgreSQL pod status
+      command: kubectl get pods -n {{ namespace }} -l app=postgresql
+      register: pods_status
+      changed_when: false
+
+    - name: Display PostgreSQL status
+      debug:
+        var: pods_status.stdout_lines
+
+    - name: Get PostgreSQL service endpoints
+      command: kubectl get svc -n {{ namespace }}
+      register: svc_status
+      changed_when: false
+
+    - name: Display service endpoints
+      debug:
+        var: svc_status.stdout_lines
+
+    - name: Test PostgreSQL connectivity
+      shell: |
+        kubectl exec -n {{ namespace }} postgresql-primary-0 -- psql -U {{ app_user }} -d {{ app_database }} -c "SELECT version();"
+      register: version_check
+      changed_when: false
+
+    - name: Display PostgreSQL version
+      debug:
+        msg: "{{ version_check.stdout_lines }}"
+
+    - name: Deployment summary
+      debug:
+        msg: |
+          =================================================
+          POSTGRESQL DEPLOYMENT COMPLETE
+          =================================================
+          Status: SUCCESS
+          Namespace: {{ namespace }}
+          Primary Service: postgresql-primary.{{ namespace }}.svc.cluster.local:5432
+          Database: {{ app_database }}
+          User: {{ app_user }}
+
+          Connection String:
+          postgresql://{{ app_user }}:PASSWORD@postgresql-primary.{{ namespace }}.svc.cluster.local:5432/{{ app_database }}
+
+          Test Connection:
+          kubectl exec -n {{ namespace }} postgresql-primary-0 -- psql -U {{ app_user }} -d {{ app_database }}
+
+          PVC: data-postgresql-primary-0 ({{ storage_size }})
+          =================================================
