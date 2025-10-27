@@ -2,6 +2,17 @@
 
 Infrastructure automation and documentation for an 8-node Raspberry Pi 5 Kubernetes (K3s) cluster.
 
+**Status**: ✅ **HEALTHY** - 116 pods running, zero errors | [Full Status Report](PROJECT-STATUS.md)
+**Security**: ⚠️ **ACTION REQUIRED** - Critical issues identified | [Security Update](SECURITY-UPDATE.md)
+**Last Updated**: October 21, 2025
+
+## Quick Status
+
+- **Nodes**: 8/8 Ready (1 master + 7 workers)
+- **Uptime**: 150 days
+- **Services**: All operational and accessible
+- **Recent Work**: Airflow deployed, cluster errors resolved, documentation updated
+
 ## Quick Start
 
 **Access Services**:
@@ -53,6 +64,12 @@ ssh -i ~/.ssh/pi_cluster admin@192.168.1.240
 
 ## Documentation
 
+### 📊 Status & Planning
+- **[PROJECT-STATUS.md](PROJECT-STATUS.md)** - Comprehensive cluster status, metrics, and health report
+- **[SECURITY-UPDATE.md](SECURITY-UPDATE.md)** - Security posture and critical action items
+- **[Improvements Roadmap](docs/roadmap/improvements-updated.md)** - Infrastructure improvements and priorities
+
+### 📚 Complete Documentation
 **[Complete Documentation Index](docs/README.md)** - All documentation organized by category
 
 ### Getting Started
