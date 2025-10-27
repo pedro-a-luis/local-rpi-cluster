@@ -132,7 +132,7 @@
 
     - name: Clean package cache
       apt:
-        clean: yes
+        autoclean: yes
 
     - name: Remove orphaned packages
       apt:
